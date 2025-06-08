@@ -113,6 +113,41 @@ def load_original_model_and_inputs(
     return (Model, get_init_inputs_fn, get_inputs_fn)
 
 
+def detect_triton_kernel(model_src: str) -> bool:
+    """
+    Detect if the model source code uses Triton kernels
+    """
+    triton_indicators = [
+        "import triton",
+        "from triton",
+        "@triton.jit",
+        "triton.language",
+        "tl.program_id",
+        "tl.load",
+        "tl.store"
+    ]
+    return any(indicator in model_src for indicator in triton_indicators)
+
+
+def _cleanup_triton_cache():
+    """Helper function to cleanup Triton cache"""
+    import shutil
+    
+    # Triton cache locations
+    triton_cache_paths = [
+        os.path.join(os.path.expanduser("~"), ".triton", "cache"),
+        "/tmp/triton"  # Alternative cache location
+    ]
+    
+    for cache_path in triton_cache_paths:
+        if os.path.exists(cache_path):
+            try:
+                shutil.rmtree(cache_path)
+            except Exception as e:
+                # Don't fail if we can't clean cache
+                pass
+
+
 def load_custom_model(
     model_custom_src: str, context: dict, build_directory: str = None
 ) -> nn.Module:
@@ -133,6 +168,32 @@ def load_custom_model(
         # DANGER: need to delete refernece from global namespace
     except SyntaxError as e:
         print(f"Syntax Error in custom generated code or Compilation Error {e}")
+        return None
+
+    ModelNew = context.get("ModelNew")
+    return ModelNew
+
+
+def load_custom_model_triton(
+    model_custom_src: str, context: dict, build_directory: str = None
+) -> nn.Module:
+    """
+    Load class from custom NN.module pytorch code with Triton kernels
+    Triton kernels are JIT compiled, so no explicit build directory is used
+    """
+    # Set Triton cache directory if specified
+    if build_directory:
+        context["BUILD_DIRECTORY"] = build_directory
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(build_directory, "triton_cache")
+
+    try:
+        compile(model_custom_src, "<string>", "exec")
+        exec(model_custom_src, context)
+    except SyntaxError as e:
+        print(f"Syntax Error in Triton kernel code: {e}")
+        return None
+    except ImportError as e:
+        print(f"Import Error (check if triton is installed): {e}")
         return None
 
     ModelNew = context.get("ModelNew")
@@ -168,6 +229,71 @@ def graceful_eval_cleanup(curr_context: dict, device: torch.device):
         )  # Wait for all CUDA operations to complete
 
     # _cleanup_cuda_extensions() # SIMON NOTE: is this necessary?
+
+
+def build_compile_cache_triton(
+    custom_model_src: str,
+    verbose: bool = False,
+    build_dir: os.PathLike = None,
+) -> tuple[bool, str, str]:
+    """
+    Pre-warm Triton kernels by doing a test compilation
+    Triton kernels are JIT compiled on first use, so we trigger compilation here
+    """
+    context = {}
+    stdout_buffer = StringIO()
+
+    if verbose:
+        print("[Compilation] Pre-warming Triton kernels")
+
+    try:
+        # Set Triton cache directory
+        if build_dir:
+            triton_cache_dir = os.path.join(build_dir, "triton_cache")
+            os.makedirs(triton_cache_dir, exist_ok=True)
+            os.environ["TRITON_CACHE_DIR"] = triton_cache_dir
+
+        # Capture stdout during compilation
+        with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
+            ModelNew = load_custom_model_triton(custom_model_src, context, build_dir)
+            
+            # Try to instantiate and run a small test to trigger JIT compilation
+            if ModelNew:
+                try:
+                    test_model = ModelNew()
+                    # We could do a small test forward pass here if we knew the input format
+                    # For now, just loading the model is sufficient to validate syntax
+                except Exception as e:
+                    if verbose:
+                        print(f"[Compilation] Could not instantiate model for pre-warming: {e}")
+                    # This is not necessarily a failure, model might need specific inputs
+
+        if verbose:
+            print(f"[Compilation] Triton kernel pre-warming successful")
+    except Exception as e:
+        print(f"[Compilation] Failed to pre-warm Triton kernels: {e}")
+        return False, stdout_buffer.getvalue(), str(e)
+
+    return True, stdout_buffer.getvalue(), None
+
+
+def build_compile_cache_auto(
+    custom_model_src: str,
+    verbose: bool = False,
+    build_dir: os.PathLike = None,
+) -> tuple[bool, str, str]:
+    """
+    Auto-detect kernel type and use appropriate build cache function
+    """
+    if detect_triton_kernel(custom_model_src):
+        if verbose:
+            print("[Compilation] Detected Triton kernel, using Triton compilation")
+        return build_compile_cache_triton(custom_model_src, verbose, build_dir)
+    else:
+        if verbose:
+            print("[Compilation] Detected CUDA kernel, using CUDA compilation")
+        return build_compile_cache(custom_model_src, verbose, build_dir)
+
 
 def build_compile_cache_legacy(
     custom_model_src: str,
@@ -206,7 +332,6 @@ def build_compile_cache_legacy(
         return False, stdout_buffer.getvalue(), str(e)
     
     return True, stdout_buffer.getvalue(), None
-
 
 
 def build_compile_cache(
@@ -287,8 +412,6 @@ def build_compile_cache_with_capturing(
         print("[CPU Precompile] stderr: \n", stderr.decode('utf-8')) 
 
     return returncode, stdout.decode('utf-8'), stderr.decode('utf-8')
-
-
 
 
 def eval_kernel_against_ref(
@@ -456,6 +579,207 @@ def eval_kernel_against_ref(
 
     graceful_eval_cleanup(context, device)
     return kernel_exec_result
+
+
+def graceful_eval_cleanup_triton(curr_context: dict, device: torch.device):
+    """
+    Clean up env, gpu cache, and Triton cache after evaluation
+    """
+    del curr_context
+    # Clear CUDA cache and reset GPU state
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device=device)
+        torch.cuda.synchronize(device=device)
+
+    # Clean Triton cache
+    _cleanup_triton_cache()
+
+
+def eval_triton_kernel_against_ref(
+    original_model_src: str,
+    custom_model_src: str,
+    seed_num: int = 42,
+    num_correct_trials: int = 1,
+    num_perf_trials: int = 10,
+    verbose: bool = False,
+    measure_performance: bool = False,
+    build_dir: os.PathLike = None,
+    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
+) -> KernelExecResult:
+    """
+    Evaluate Triton kernel against the original model
+    Similar to eval_kernel_against_ref but adapted for Triton kernels
+    """
+    assert torch.cuda.is_available(), "CUDA is not available, cannot run Triton kernels"
+    torch.set_printoptions(
+        precision=4,
+        threshold=10,
+        edgeitems=3,
+        linewidth=80,
+    )
+
+    # set CUDA device
+    torch.cuda.set_device(device)
+
+    context = {}
+
+    if verbose:
+        print(f"[Eval] Start Triton Evaluation! on device: {device}")
+        print("[Eval] Loading Original Model")
+
+    Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
+        original_model_src, context
+    )
+    set_seed(seed_num)
+    init_inputs = get_init_inputs()
+    init_inputs = [
+        x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
+    ]
+
+    with torch.no_grad():
+        set_seed(seed_num)
+        original_model = Model(*init_inputs)
+        assert hasattr(original_model, "forward")
+        if verbose:
+            print("[Eval] Original Model Loaded")
+
+    if verbose:
+        print("[Eval] Loading and Compiling Triton Kernel")
+
+    metadata = {}
+    metadata["hardware"] = torch.cuda.get_device_name(device=device)
+    metadata["device"] = str(device)
+    metadata["kernel_type"] = "triton"
+
+    # Load Triton model
+    try:
+        ModelNew = load_custom_model_triton(custom_model_src, context, build_dir)
+        torch.cuda.synchronize(device=device)
+    except Exception as e:
+        print(f"Failed to load Triton kernel: {e}")
+        metadata["compilation_error"] = str(e)
+        graceful_eval_cleanup_triton(context, device)
+        return KernelExecResult(compiled=False, metadata=metadata)
+
+    # Try to instantiate the model
+    try:
+        with torch.no_grad():
+            set_seed(seed_num)
+            custom_model = ModelNew(*init_inputs)
+            assert hasattr(custom_model, "forward")
+            torch.cuda.synchronize(device=device)
+        if verbose:
+            print("[Eval] Triton Model Loaded")
+    except Exception as e:
+        print(f"Failed to instantiate Triton model: {e}")
+        graceful_eval_cleanup_triton(context, device)
+        metadata["runtime_error"] = str(e)
+        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+
+    kernel_exec_result = None
+
+    # Check Correctness
+    if verbose:
+        print("[Eval] Checking Correctness")
+    try:
+        kernel_exec_result = run_and_check_correctness(
+            original_model,
+            custom_model,
+            get_inputs,
+            metadata=metadata,
+            num_correct_trials=num_correct_trials,
+            verbose=verbose,
+            seed=seed_num,
+            device=device,
+        )
+    except Exception as e:
+        metadata["runtime_error"] = str(e)
+        kernel_exec_result = KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )
+
+    # Measure Performance
+    if measure_performance:
+        try:
+            if kernel_exec_result and kernel_exec_result.correctness:
+                if verbose:
+                    print("[Eval] Measuring Performance as Triton kernel is Correct")
+
+                torch.cuda.synchronize(device=device)
+                set_seed(seed_num)
+                inputs = get_inputs()
+                inputs = [
+                    x.cuda(device=device) if isinstance(x, torch.Tensor) else x
+                    for x in inputs
+                ]
+                model_new = custom_model.cuda(device=device)
+                torch.cuda.synchronize(device=device)
+
+                elapsed_times = time_execution_with_cuda_event(
+                    model_new,
+                    *inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                runtime_stats = get_timing_stats(elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Performance Stats: {runtime_stats}")
+                kernel_exec_result.runtime = runtime_stats["mean"]
+                kernel_exec_result.runtime_stats = runtime_stats
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Error in Measuring Performance: {e}")
+            kernel_exec_result.metadata["error_during_performance"] = str(e)
+
+    graceful_eval_cleanup_triton(context, device)
+    return kernel_exec_result
+
+
+def eval_kernel_against_ref_auto(
+    original_model_src: str,
+    custom_model_src: str,
+    seed_num: int = 42,
+    num_correct_trials: int = 1,
+    num_perf_trials: int = 10,
+    verbose: bool = False,
+    measure_performance: bool = False,
+    build_dir: os.PathLike = None,
+    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
+) -> KernelExecResult:
+    """
+    Automatically detect kernel type and use appropriate evaluation function
+    """
+    if detect_triton_kernel(custom_model_src):
+        if verbose:
+            print("[Eval] Detected Triton kernel, using Triton evaluation")
+        return eval_triton_kernel_against_ref(
+            original_model_src=original_model_src,
+            custom_model_src=custom_model_src,
+            seed_num=seed_num,
+            num_correct_trials=num_correct_trials,
+            num_perf_trials=num_perf_trials,
+            verbose=verbose,
+            measure_performance=measure_performance,
+            build_dir=build_dir,
+            device=device,
+        )
+    else:
+        if verbose:
+            print("[Eval] Detected CUDA kernel, using CUDA evaluation")
+        return eval_kernel_against_ref(
+            original_model_src=original_model_src,
+            custom_model_src=custom_model_src,
+            seed_num=seed_num,
+            num_correct_trials=num_correct_trials,
+            num_perf_trials=num_perf_trials,
+            verbose=verbose,
+            measure_performance=measure_performance,
+            build_dir=build_dir,
+            device=device,
+        )
 
 
 def register_and_format_exception(

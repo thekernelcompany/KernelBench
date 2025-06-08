@@ -8,7 +8,7 @@ import modal
 from datasets import load_dataset
 
 #from src.dataset import construct_kernelbench_dataset
-from src.eval import eval_kernel_against_ref
+from src.eval import eval_kernel_against_ref_auto
 from src.prompt_constructor import prompt_generate_custom_cuda_from_prompt_template
 from src.utils import extract_first_code, query_server, set_gpu_arch, read_file, create_inference_server_from_presets
 
@@ -99,6 +99,7 @@ image = (
         "pytest",
         "ninja",
         "utils",
+        "triton",
     )
 )
 
@@ -110,11 +111,16 @@ class EvalFunc:
         # 3. Evaluate Kernel
         # NOTE: no need to wrap around process here as only a single sample
         # see batch eval for examples of process isolation
-        from src.eval import eval_kernel_against_ref
+        from src.eval import eval_kernel_against_ref_auto
         from src.utils import set_gpu_arch
         set_gpu_arch(gpu_arch)
-        return eval_kernel_against_ref(
-            ref_arch_src, custom_cuda, verbose=verbose, measure_performance=True, num_correct_trials=5, num_perf_trials=100
+        return eval_kernel_against_ref_auto(
+            original_model_src=ref_arch_src, 
+            custom_model_src=custom_cuda, 
+            verbose=verbose, 
+            measure_performance=True, 
+            num_correct_trials=5, 
+            num_perf_trials=100
         )
 
 @pydra.main(base=EvalConfig)

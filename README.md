@@ -90,6 +90,20 @@ python3 scripts/generate_and_eval_single_sample.py dataset_src="huggingface" lev
 # add .verbose_logging for more visbility
 ```
 
+### 🔥 **NEW: Triton Kernel Support**
+KernelBench now supports both CUDA and Triton kernels with automatic detection!
+
+```bash
+# Evaluate Triton kernels with auto-detection
+python3 scripts/run_and_check_triton.py \
+    ref_origin=kernelbench \
+    level=1 \
+    problem_id=1 \
+    kernel_src_path=your_triton_kernel.py
+
+# See TRITON_README.md for complete guide
+```
+
 ### Run on all problems 
 
 ```
@@ -115,7 +129,7 @@ We provide some reference baseline times a variety of NVIDIA GPUs across generat
 We have also releaed the test-time framework [Caesar](https://github.com/simonguozirui/caesar) that are used in the multi-turn / iterative refinement experiments in our paper. You can use or modify this framework for high-throughput test-time scaling (both sequential and parallel) targeting KernelBench problems. 
 
 ## 🛣️ Upcoming Roadmap
-- [ ] Triton Variant (To be merged)
+- [x] Triton Variant (✅ **Now Available!** - See `TRITON_README.md`)
 - [ ] Easy to use CoLab Notebook Example
 - [ ] Push button flow on Modal / Cloud Provider 
 - [ ] Integrate with more frameworks, such as [ThunderKittens](https://github.com/HazyResearch/ThunderKittens)

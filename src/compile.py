@@ -5,7 +5,7 @@ import time
 from tqdm import tqdm
 
 import shutil
-from src.eval import build_compile_cache
+from src.eval import build_compile_cache_auto
 from src import utils as utils
 import torch
 import os
@@ -47,7 +47,7 @@ def compile_single_sample(work_args: WorkArgs, config: dict) -> tuple[bool, str]
         kernel_src = f.read()
 
     try:
-        compiled_and_cached, stdout_content, error_msg = build_compile_cache(custom_model_src=kernel_src,
+        compiled_and_cached, stdout_content, error_msg = build_compile_cache_auto(custom_model_src=kernel_src,
                                                        verbose=verbose, 
                                                        build_dir=build_dir)
 

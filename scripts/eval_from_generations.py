@@ -15,7 +15,7 @@ import multiprocessing as mp
 from datasets import load_dataset
 
 from src.dataset import construct_kernelbench_dataset
-from src.eval import build_compile_cache, eval_kernel_against_ref, KernelExecResult, check_metadata_serializable_all_types
+from src.eval import build_compile_cache_auto, eval_kernel_against_ref_auto, KernelExecResult, check_metadata_serializable_all_types
 from src.utils import set_gpu_arch, read_file
 
 """
@@ -151,7 +151,7 @@ def evaluate_single_sample(work_args: WorkArgs, configs: EvalConfig, dataset, ru
     build_dir = os.path.join(configs.kernel_eval_build_dir, configs.run_name, f"{problem_id}", f"{sample_id}")
 
     try: 
-        eval_result = eval_kernel_against_ref(
+        eval_result = eval_kernel_against_ref_auto(
             original_model_src=ref_arch_src,
             custom_model_src=kernel_src,
             measure_performance=configs.measure_performance,
