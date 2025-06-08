@@ -6,11 +6,17 @@ import os
 from datasets import load_dataset
 
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src import eval as kernel_eval
 from src import utils as kernel_utils
-from scripts.generate_baseline_time import measure_program_time
-
 from src.utils import read_file
+
+# Import measure_program_time from generate_baseline_time
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'scripts'))
+from generate_baseline_time import measure_program_time
 
 """
 Run a pair of KernelBench format (problem, solution) to check if Triton solution is correct and compute speedup

@@ -13,8 +13,12 @@ import json
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 import sys
+import os
 
-from . import utils
+# Fix import path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src import utils
 
 REPO_TOP_PATH = os.path.abspath(
     os.path.join(
@@ -179,25 +183,122 @@ def load_custom_model_triton(
 ) -> nn.Module:
     """
     Load class from custom NN.module pytorch code with Triton kernels
-    Triton kernels are JIT compiled, so no explicit build directory is used
+    This is the Triton equivalent of load_custom_model with the same robustness
+    
+    This function writes the source code to a persistent file and imports it
+    to work around Triton's inspect.getsourcelines() requirement
     """
-    # Set Triton cache directory if specified
+    import tempfile
+    import importlib.util
+    import sys
+    import hashlib
+    
+    # Set build directory and environment variables (matching CUDA behavior)
     if build_directory:
         context["BUILD_DIRECTORY"] = build_directory
-        os.environ["TRITON_CACHE_DIR"] = os.path.join(build_directory, "triton_cache")
+        # Set Triton cache directory
+        triton_cache_dir = os.path.join(build_directory, "triton_cache")
+        os.makedirs(triton_cache_dir, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = triton_cache_dir
+        
+        # Use build directory for the temporary module (like CUDA uses TORCH_EXTENSIONS_DIR)
+        temp_dir = build_directory
+        
+        # Add environment setup to source code (matching CUDA pattern)
+        model_custom_src = (
+            "import os\n"
+            f"os.environ['TRITON_CACHE_DIR'] = '{triton_cache_dir}'\n"
+        ) + model_custom_src
+    else:
+        # Use system temp directory
+        temp_dir = tempfile.gettempdir()
 
     try:
+        # First, verify the code compiles (matching CUDA behavior)
         compile(model_custom_src, "<string>", "exec")
-        exec(model_custom_src, context)
+        
+        # Create a hash-based filename to avoid conflicts (like CUDA kernel hashing)
+        code_hash = hashlib.md5(model_custom_src.encode()).hexdigest()
+        module_filename = f"triton_kernel_{code_hash}.py"
+        module_path = os.path.join(temp_dir, module_filename)
+        
+        # Ensure the directory exists
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Write the source code to a persistent file
+        try:
+            with open(module_path, 'w', encoding='utf-8') as f:
+                f.write(model_custom_src)
+        except (IOError, OSError) as e:
+            # Handle file write errors (like CUDA handles directory/lock errors)
+            if "lock" in str(e).lower() or "permission" in str(e).lower():
+                raise RuntimeError(f"File lock or permission error: {e}")
+            raise e
+        
+        module_name = f"triton_kernel_module_{code_hash}"
+        
+        try:
+            # Import the module from the file
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not create module spec for {module_path}")
+                
+            module = importlib.util.module_from_spec(spec)
+            
+            # Add to sys.modules to make it findable by inspect (before execution)
+            sys.modules[module_name] = module
+            
+            # Store cleanup info in context (before execution in case it fails)
+            context["_triton_module_path"] = module_path
+            context["_triton_module_name"] = module_name
+            
+            # Execute the module
+            spec.loader.exec_module(module)
+            
+            # Extract ModelNew from the module (matching CUDA error handling)
+            ModelNew = getattr(module, "ModelNew", None)
+            if ModelNew is None:
+                raise AttributeError("ModelNew class not found in Triton kernel code")
+                
+            # Update context with all module attributes for compatibility
+            for attr_name in dir(module):
+                if not attr_name.startswith('_'):
+                    context[attr_name] = getattr(module, attr_name)
+            
+            return ModelNew
+            
+        except Exception as e:
+            # Clean up on error (more comprehensive like CUDA)
+            cleanup_error = None
+            try:
+                if module_name in sys.modules:
+                    del sys.modules[module_name]
+            except Exception as cleanup_e:
+                cleanup_error = cleanup_e
+                
+            try:
+                if os.path.exists(module_path):
+                    os.unlink(module_path)
+            except Exception as cleanup_e:
+                if cleanup_error is None:
+                    cleanup_error = cleanup_e
+            
+            # Remove from context if we added it
+            context.pop("_triton_module_path", None)
+            context.pop("_triton_module_name", None)
+            
+            # Re-raise original error (not cleanup error)
+            raise e
+                
     except SyntaxError as e:
-        print(f"Syntax Error in Triton kernel code: {e}")
+        print(f"Syntax Error in Triton kernel code or Compilation Error {e}")
         return None
     except ImportError as e:
         print(f"Import Error (check if triton is installed): {e}")
         return None
-
-    ModelNew = context.get("ModelNew")
-    return ModelNew
+    except Exception as e:
+        print(f"Error loading Triton kernel: {e}")
+        return None
 
 
 def _cleanup_cuda_extensions():
@@ -238,7 +339,13 @@ def build_compile_cache_triton(
 ) -> tuple[bool, str, str]:
     """
     Pre-warm Triton kernels by doing a test compilation
+    This is the Triton equivalent of build_compile_cache with the same robustness
+    
     Triton kernels are JIT compiled on first use, so we trigger compilation here
+    Should be able to run on CPUs to do this massively in parallel
+    
+    Returns:
+        tuple[bool, str, str]: whether compilation is successful, stdout content as string, error message
     """
     context = {}
     stdout_buffer = StringIO()
@@ -247,31 +354,40 @@ def build_compile_cache_triton(
         print("[Compilation] Pre-warming Triton kernels")
 
     try:
-        # Set Triton cache directory
+        # Set Triton environment variables (equivalent to CUDA's TORCH_USE_CUDA_DSA)
+        os.environ["TRITON_PRINT_AUTOTUNING"] = "0"  # reduce noise during compilation
+        
+        # Set Triton cache directory if build_dir is provided
         if build_dir:
             triton_cache_dir = os.path.join(build_dir, "triton_cache")
             os.makedirs(triton_cache_dir, exist_ok=True)
             os.environ["TRITON_CACHE_DIR"] = triton_cache_dir
 
-        # Capture stdout during compilation
+        # Capture stdout during compilation (matching CUDA pattern)
         with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
             ModelNew = load_custom_model_triton(custom_model_src, context, build_dir)
             
-            # Try to instantiate and run a small test to trigger JIT compilation
+            # Try to instantiate to trigger any immediate compilation errors
             if ModelNew:
                 try:
                     test_model = ModelNew()
-                    # We could do a small test forward pass here if we knew the input format
-                    # For now, just loading the model is sufficient to validate syntax
+                    # Successful instantiation means basic compilation worked
+                    if verbose:
+                        print(f"[Compilation] Triton model instantiation successful")
                 except Exception as e:
                     if verbose:
-                        print(f"[Compilation] Could not instantiate model for pre-warming: {e}")
-                    # This is not necessarily a failure, model might need specific inputs
+                        print(f"[Compilation] Model instantiation failed (may need specific inputs): {e}")
+                    # This is not necessarily a compilation failure for Triton kernels
+                    # that require specific input shapes for JIT compilation
+            else:
+                raise RuntimeError("ModelNew class not found after compilation")
 
         if verbose:
-            print(f"[Compilation] Triton kernel pre-warming successful")
+            print(f"[Compilation] Triton kernel pre-warming successful, saved cache at: {build_dir}")
+            
     except Exception as e:
-        print(f"[Compilation] Failed to pre-warm Triton kernels: {e}")
+        error_msg = f"Failed to compile Triton kernel. Unable to cache, \nError: {e}"
+        print(f"[Compilation] {error_msg}")
         return False, stdout_buffer.getvalue(), str(e)
 
     return True, stdout_buffer.getvalue(), None
@@ -432,8 +548,19 @@ def eval_kernel_against_ref(
     num_perf_trials: run the evalutation many times to take the average
     device: GPU (cuda) device to run the evalutation on
     """
-    # TODO: check device is busy
+    # Check device availability and status
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
+    
+    # Verify device is valid
+    if device.type != 'cuda':
+        raise ValueError(f"Device must be CUDA device, got {device}")
+    
+    # Check if device is accessible
+    try:
+        torch.cuda.set_device(device)
+        torch.cuda.current_device()
+    except Exception as e:
+        raise RuntimeError(f"Cannot access CUDA device {device}: {e}")
     torch.set_printoptions(
         precision=4,  # Decimal places
         threshold=10,  # Total number of elements before truncating
@@ -482,9 +609,13 @@ def eval_kernel_against_ref(
         print(
             f"Failed to compile custom CUDA kernel: Record as compilation failure. \nError: {e}"
         )
-        # TODO: add metadata for compilation error (how to we get the compilation error message?)
-
-        if "lock" in str(e) or "No such file or directory" in str(e):
+        # Categorize and add detailed metadata for compilation errors
+        error_str = str(e)
+        metadata["compilation_error"] = error_str
+        
+        # Categorize error types for better debugging
+        if "lock" in error_str.lower() or "no such file or directory" in error_str.lower():
+            metadata["error_category"] = "file_system_error"
             # this is a lock file error, likely due to concurrent compilation
             # this does not necessarily mean the compilation failed, but we should retry
             print(
@@ -492,12 +623,21 @@ def eval_kernel_against_ref(
             )
             graceful_eval_cleanup(context, device)
             return None
+        elif "permission" in error_str.lower():
+            metadata["error_category"] = "permission_error"
+        elif "cuda" in error_str.lower():
+            metadata["error_category"] = "cuda_compilation_error"
+        elif "syntax" in error_str.lower():
+            metadata["error_category"] = "syntax_error"
+        elif "import" in error_str.lower():
+            metadata["error_category"] = "import_error"
         else:
-            metadata["compilation_error"] = e
-            graceful_eval_cleanup(context, device)
-            return KernelExecResult(
-                compiled=False, metadata=metadata
-            )  # skip further steps
+            metadata["error_category"] = "unknown_compilation_error"
+            
+        graceful_eval_cleanup(context, device)
+        return KernelExecResult(
+            compiled=False, metadata=metadata
+        )  # skip further steps
 
     # at this point we passed compilation
     try:
@@ -512,9 +652,28 @@ def eval_kernel_against_ref(
         print(
             f"Failed to load custom CUDA kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
         )
-        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        # Categorize and add detailed metadata for runtime errors
+        error_str = str(e)
+        metadata["runtime_error"] = error_str
+        
+        # Categorize runtime error types for better debugging
+        if "cuda" in error_str.lower():
+            if "illegal memory access" in error_str.lower():
+                metadata["error_category"] = "cuda_illegal_memory_access"
+            elif "out of memory" in error_str.lower():
+                metadata["error_category"] = "cuda_out_of_memory"
+            elif "invalid device" in error_str.lower():
+                metadata["error_category"] = "cuda_invalid_device"
+            else:
+                metadata["error_category"] = "cuda_runtime_error"
+        elif "kernel" in error_str.lower():
+            metadata["error_category"] = "kernel_launch_error"
+        elif "dimension" in error_str.lower() or "shape" in error_str.lower():
+            metadata["error_category"] = "tensor_dimension_error"
+        else:
+            metadata["error_category"] = "unknown_runtime_error"
+            
         graceful_eval_cleanup(context, device)
-        metadata["runtime_error"] = e
         return KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
         )  # skip further steps
@@ -536,8 +695,25 @@ def eval_kernel_against_ref(
             device=device,
         )
     except Exception as e:
-        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
-        metadata["runtime_error"] = e
+        # Categorize and add detailed metadata for correctness check errors
+        error_str = str(e)
+        metadata["runtime_error"] = error_str
+        
+        # Categorize error types during correctness checking
+        if "cuda" in error_str.lower():
+            if "illegal memory access" in error_str.lower():
+                metadata["error_category"] = "cuda_illegal_memory_access"
+            elif "out of memory" in error_str.lower():
+                metadata["error_category"] = "cuda_out_of_memory"
+            else:
+                metadata["error_category"] = "cuda_runtime_error"
+        elif "kernel" in error_str.lower():
+            metadata["error_category"] = "kernel_launch_error"
+        elif "dimension" in error_str.lower() or "shape" in error_str.lower():
+            metadata["error_category"] = "tensor_dimension_error"
+        else:
+            metadata["error_category"] = "correctness_check_error"
+            
         kernel_exec_result = KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
         )
@@ -585,6 +761,24 @@ def graceful_eval_cleanup_triton(curr_context: dict, device: torch.device):
     """
     Clean up env, gpu cache, and Triton cache after evaluation
     """
+    # Clean up temporary Triton module files if they exist
+    if "_triton_module_path" in curr_context:
+        try:
+            module_path = curr_context["_triton_module_path"]
+            if os.path.exists(module_path):
+                os.unlink(module_path)
+        except Exception:
+            pass  # Ignore cleanup errors
+    
+    if "_triton_module_name" in curr_context:
+        try:
+            import sys
+            module_name = curr_context["_triton_module_name"]
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+        except Exception:
+            pass  # Ignore cleanup errors
+    
     del curr_context
     # Clear CUDA cache and reset GPU state
     with torch.cuda.device(device):
@@ -609,14 +803,30 @@ def eval_triton_kernel_against_ref(
 ) -> KernelExecResult:
     """
     Evaluate Triton kernel against the original model
-    Similar to eval_kernel_against_ref but adapted for Triton kernels
+    This is the Triton equivalent of eval_kernel_against_ref with the same robustness
+    
+    num_correct_trials: number of trials to initialize different random inputs; correctness pass only if all trials pass
+    num_perf_trials: run the evaluation many times to take the average
+    device: GPU (cuda) device to run the evaluation on
     """
+    # Check device availability and status
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Triton kernels"
+    
+    # Verify device is valid
+    if device.type != 'cuda':
+        raise ValueError(f"Device must be CUDA device, got {device}")
+    
+    # Check if device is accessible
+    try:
+        torch.cuda.set_device(device)
+        torch.cuda.current_device()
+    except Exception as e:
+        raise RuntimeError(f"Cannot access CUDA device {device}: {e}")
     torch.set_printoptions(
-        precision=4,
-        threshold=10,
-        edgeitems=3,
-        linewidth=80,
+        precision=4,  # Decimal places
+        threshold=10,  # Total number of elements before truncating
+        edgeitems=3,  # Number of elements at beginning and end of dimensions
+        linewidth=80,  # Maximum width before wrapping
     )
 
     # set CUDA device
@@ -631,51 +841,121 @@ def eval_triton_kernel_against_ref(
     Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
         original_model_src, context
     )
-    set_seed(seed_num)
+    set_seed(seed_num)  # set seed for reproducible input
     init_inputs = get_init_inputs()
     init_inputs = [
         x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
     ]
 
     with torch.no_grad():
-        set_seed(seed_num)
+        set_seed(seed_num)  # set seed for reproducible weights
         original_model = Model(*init_inputs)
         assert hasattr(original_model, "forward")
         if verbose:
             print("[Eval] Original Model Loaded")
-
     if verbose:
         print("[Eval] Loading and Compiling Triton Kernel")
 
-    metadata = {}
+    metadata = {}  # for storing result metadata
     metadata["hardware"] = torch.cuda.get_device_name(device=device)
-    metadata["device"] = str(device)
+    metadata["device"] = str(device)  # for debugging
     metadata["kernel_type"] = "triton"
 
-    # Load Triton model
+    # this is where compilation happens (matching CUDA structure)
     try:
+        # Set Triton environment variables (equivalent to CUDA's TORCH_USE_CUDA_DSA)
+        os.environ["TRITON_PRINT_AUTOTUNING"] = "0"  # reduce noise during eval
+        # add hash for later to distinguish between multi-turn kernels
         ModelNew = load_custom_model_triton(custom_model_src, context, build_dir)
-        torch.cuda.synchronize(device=device)
+        torch.cuda.synchronize(device=device)  # not sure if this is too much
     except Exception as e:
-        print(f"Failed to load Triton kernel: {e}")
-        metadata["compilation_error"] = str(e)
+        print(
+            f"Failed to compile Triton kernel: Record as compilation failure. \nError: {e}"
+        )
+        # Categorize and add detailed metadata for compilation errors (Triton-specific)
+        error_str = str(e)
+        metadata["compilation_error"] = error_str
+        
+        # Categorize error types for better debugging
+        if "lock" in error_str.lower() or "no such file or directory" in error_str.lower():
+            metadata["error_category"] = "file_system_error"
+            # this is a lock file error, likely due to concurrent compilation
+            # this does not necessarily mean the compilation failed, but we should retry
+            print(
+                f"[Eval] Lock file or permission error during Triton compilation, Please retry. Error: {e}"
+            )
+            graceful_eval_cleanup_triton(context, device)
+            return None
+        elif "permission" in error_str.lower():
+            metadata["error_category"] = "permission_error"
+        elif "triton" in error_str.lower():
+            if "not installed" in error_str.lower() or "import" in error_str.lower():
+                metadata["error_category"] = "triton_import_error"
+            elif "jit" in error_str.lower():
+                metadata["error_category"] = "triton_jit_error"
+            else:
+                metadata["error_category"] = "triton_compilation_error"
+        elif "syntax" in error_str.lower():
+            metadata["error_category"] = "syntax_error"
+        elif "import" in error_str.lower():
+            metadata["error_category"] = "import_error"
+        elif "could not get source code" in error_str.lower():
+            metadata["error_category"] = "triton_source_inspection_error"
+        else:
+            metadata["error_category"] = "unknown_compilation_error"
+            
         graceful_eval_cleanup_triton(context, device)
-        return KernelExecResult(compiled=False, metadata=metadata)
+        return KernelExecResult(
+            compiled=False, metadata=metadata
+        )  # skip further steps
 
-    # Try to instantiate the model
+    # at this point we passed compilation
     try:
         with torch.no_grad():
-            set_seed(seed_num)
+            set_seed(seed_num)  # set seed for reproducible weights
             custom_model = ModelNew(*init_inputs)
             assert hasattr(custom_model, "forward")
             torch.cuda.synchronize(device=device)
         if verbose:
             print("[Eval] Triton Model Loaded")
-    except Exception as e:
-        print(f"Failed to instantiate Triton model: {e}")
+    except RuntimeError as e:
+        print(
+            f"Failed to load Triton kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
+        )
+        # Categorize and add detailed metadata for runtime errors
+        error_str = str(e)
+        metadata["runtime_error"] = error_str
+        
+        # Categorize runtime error types for better debugging (Triton-specific)
+        if "triton" in error_str.lower():
+            if "compilation" in error_str.lower():
+                metadata["error_category"] = "triton_jit_compilation_error"
+            elif "autotuning" in error_str.lower():
+                metadata["error_category"] = "triton_autotuning_error"
+            else:
+                metadata["error_category"] = "triton_runtime_error"
+        elif "cuda" in error_str.lower():
+            if "illegal memory access" in error_str.lower():
+                metadata["error_category"] = "cuda_illegal_memory_access"
+            elif "out of memory" in error_str.lower():
+                metadata["error_category"] = "cuda_out_of_memory"
+            elif "invalid device" in error_str.lower():
+                metadata["error_category"] = "cuda_invalid_device"
+            else:
+                metadata["error_category"] = "cuda_runtime_error"
+        elif "kernel" in error_str.lower():
+            metadata["error_category"] = "kernel_launch_error"
+        elif "dimension" in error_str.lower() or "shape" in error_str.lower():
+            metadata["error_category"] = "tensor_dimension_error"
+        elif "could not get source code" in error_str.lower():
+            metadata["error_category"] = "triton_source_inspection_error"
+        else:
+            metadata["error_category"] = "unknown_runtime_error"
+            
         graceful_eval_cleanup_triton(context, device)
-        metadata["runtime_error"] = str(e)
-        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+        return KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )  # skip further steps
 
     kernel_exec_result = None
 
@@ -694,12 +974,39 @@ def eval_triton_kernel_against_ref(
             device=device,
         )
     except Exception as e:
-        metadata["runtime_error"] = str(e)
+        # Categorize and add detailed metadata for correctness check errors (Triton-specific)
+        error_str = str(e)
+        metadata["runtime_error"] = error_str
+        
+        # Categorize error types during correctness checking
+        if "triton" in error_str.lower():
+            if "compilation" in error_str.lower():
+                metadata["error_category"] = "triton_jit_compilation_error"
+            elif "autotuning" in error_str.lower():
+                metadata["error_category"] = "triton_autotuning_error"
+            else:
+                metadata["error_category"] = "triton_runtime_error"
+        elif "cuda" in error_str.lower():
+            if "illegal memory access" in error_str.lower():
+                metadata["error_category"] = "cuda_illegal_memory_access"
+            elif "out of memory" in error_str.lower():
+                metadata["error_category"] = "cuda_out_of_memory"
+            else:
+                metadata["error_category"] = "cuda_runtime_error"
+        elif "kernel" in error_str.lower():
+            metadata["error_category"] = "kernel_launch_error"
+        elif "dimension" in error_str.lower() or "shape" in error_str.lower():
+            metadata["error_category"] = "tensor_dimension_error"
+        elif "could not get source code" in error_str.lower():
+            metadata["error_category"] = "triton_source_inspection_error"
+        else:
+            metadata["error_category"] = "correctness_check_error"
+            
         kernel_exec_result = KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
         )
 
-    # Measure Performance
+    # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
     if measure_performance:
         try:
             if kernel_exec_result and kernel_exec_result.correctness:
