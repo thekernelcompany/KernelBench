@@ -20,7 +20,7 @@ graph TD
     B --> H["numpy (external)"];
     B --> I["pydantic (external)"];
 
-    C --> E; -- implicit for set_gpu_arch
+    C -- "implicit for set_gpu_arch" --> E;
 
     D --> B;
     D --> J["src/dataset.py"];
