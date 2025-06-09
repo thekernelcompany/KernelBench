@@ -49,7 +49,7 @@ class Model(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-batch_size = 128
+batch_size = 64
 max_seqlen = 1024
 seq_len = 512
 n_embd = 768

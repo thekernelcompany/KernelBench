@@ -11,3 +11,5 @@ cache/*
 !results/timing/
 .env
 venv
+.DS_Store
+.cursor
