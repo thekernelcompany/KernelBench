@@ -10,7 +10,7 @@ This document explains how to use the Modal-based automation for running Triton 
    pip install modal
    modal token new
    ```
-
+> Note: Python 3.10 might have issues with SSL
 ## 🎯 Quick Start
 
 ### 1. Against KernelBench Problem (Recommended)
