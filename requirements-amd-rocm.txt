@@ -1,0 +1,48 @@
+# KernelBench Requirements for AMD GPUs with ROCm Support
+# This requirements file is specifically designed for AMD GPU systems with ROCm
+# 
+# Prerequisites:
+# - ROCm 6.0+ installed on the system
+# - AMD GPU with ROCm support (e.g., MI300X, MI250X, RX 7900 XTX, etc.)
+#
+# Installation:
+# pip install -r requirements-amd-rocm.txt --index-url https://download.pytorch.org/whl/rocm6.1
+#
+# Or use the install script: ./install-amd-rocm.sh
+
+# Core ML/AI Dependencies (ROCm versions)
+# Note: PyTorch ROCm packages come from a separate index
+# These will be installed via --index-url https://download.pytorch.org/whl/rocm6.1
+torch>=2.6.0
+torchvision>=0.21.0
+torchaudio>=2.6.0
+
+# Triton (should work with both CUDA and ROCm backends)
+triton>=3.1.0
+
+# Core Python Scientific Computing
+numpy>=2.2.0
+packaging
+
+# KernelBench Specific Dependencies
+pydra_config
+ninja>=1.11.0
+einops>=0.8.0
+
+# Dataset and Model Loading
+datasets>=3.6.0
+transformers>=4.52.0
+tqdm>=4.67.0
+
+# AI API Clients
+anthropic>=0.34.0
+openai>=1.86.0
+google-generativeai>=0.8.5
+together>=1.5.0
+
+# Cloud/Deployment
+modal>=1.0.0
+archon-ai>=0.1.4
+
+# Testing
+pytest>=8.4.0 
