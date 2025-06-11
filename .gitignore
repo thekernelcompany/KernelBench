@@ -13,3 +13,13 @@ cache/*
 venv
 .DS_Store
 .cursor
+command.md
+*.zip
+cursorchanges.md
+
+# Backward pass implementation - build and working directories
+test_build/
+level_1_triton_kernel/
+level1_todo.md
+*/runs/
+debug_*.py
