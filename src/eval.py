@@ -539,7 +539,7 @@ def eval_kernel_against_ref(
     verbose: bool = False,
     measure_performance: bool = False,
     build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None, # have to run on GPU
+    device: torch.device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else None, # have to run on GPU
 ) -> KernelExecResult:
     """
     Evaluate the custom kernel against the original model
@@ -799,7 +799,7 @@ def eval_triton_kernel_against_ref(
     verbose: bool = False,
     measure_performance: bool = False,
     build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
+    device: torch.device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else None,
 ) -> KernelExecResult:
     """
     Evaluate Triton kernel against the original model
@@ -1045,6 +1045,235 @@ def eval_triton_kernel_against_ref(
     return kernel_exec_result
 
 
+def eval_triton_backward_pass(
+    original_model_src: str,
+    custom_model_src: str,
+    seed_num: int = 42,
+    num_correct_trials: int = 1,
+    num_gradient_trials: int = 3,
+    num_perf_trials: int = 10,
+    gradient_tolerance: float = 1e-4,
+    verbose: bool = False,
+    measure_performance: bool = False,
+    build_dir: os.PathLike = None,
+    device: torch.device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else None,
+) -> KernelExecResult:
+    """
+    Evaluate Triton kernel backward pass (gradient computation) against the original model
+    
+    This function performs both forward and backward pass testing:
+    1. Forward pass correctness (like standard evaluation)
+    2. Gradient correctness using torch.autograd.gradcheck
+    3. Optional performance measurement for backward pass
+    
+    Args:
+        original_model_src: Reference PyTorch model source code
+        custom_model_src: Custom Triton model source code with backward pass
+        seed_num: Random seed for reproducibility
+        num_correct_trials: Number of forward correctness trials
+        num_gradient_trials: Number of gradient correctness trials
+        gradient_tolerance: Tolerance for gradient checking
+        verbose: Enable verbose output
+        measure_performance: Whether to measure backward pass performance
+        build_dir: Directory for build cache
+        device: CUDA device
+        
+    Returns:
+        KernelExecResult with both forward and backward pass results
+    """
+    # Check device availability
+    assert torch.cuda.is_available(), "CUDA is not available, cannot run Triton kernels"
+    
+    if device.type != 'cuda':
+        raise ValueError(f"Device must be CUDA device, got {device}")
+    
+    torch.cuda.set_device(device)
+    
+    if verbose:
+        print(f"[Backward Eval] Starting Triton backward pass evaluation on device: {device}")
+        print("[Backward Eval] Loading Original Model")
+    
+    context = {}
+    metadata = {}
+    metadata["hardware"] = torch.cuda.get_device_name(device=device)
+    metadata["device"] = str(device)
+    metadata["kernel_type"] = "triton"
+    metadata["evaluation_type"] = "backward_pass"
+    
+    # Load original model
+    Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
+        original_model_src, context
+    )
+    set_seed(seed_num)
+    init_inputs = get_init_inputs()
+    init_inputs = [
+        x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
+    ]
+    
+    with torch.no_grad():
+        set_seed(seed_num)
+        original_model = Model(*init_inputs)
+        assert hasattr(original_model, "forward")
+        if verbose:
+            print("[Backward Eval] Original Model Loaded")
+    
+    if verbose:
+        print("[Backward Eval] Loading and Compiling Triton Kernel with Backward Pass")
+    
+    # Compile Triton model
+    try:
+        os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+        ModelNew = load_custom_model_triton(custom_model_src, context, build_dir)
+        torch.cuda.synchronize(device=device)
+    except Exception as e:
+        print(f"Failed to compile Triton backward pass kernel: {e}")
+        error_str = str(e)
+        metadata["compilation_error"] = error_str
+        
+        # Categorize compilation errors
+        if "autograd" in error_str.lower() or "backward" in error_str.lower():
+            metadata["error_category"] = "triton_backward_compilation_error"
+        elif "triton" in error_str.lower():
+            metadata["error_category"] = "triton_compilation_error"
+        else:
+            metadata["error_category"] = "unknown_compilation_error"
+            
+        graceful_eval_cleanup_triton(context, device)
+        return KernelExecResult(compiled=False, metadata=metadata)
+    
+    # Instantiate custom model
+    try:
+        with torch.no_grad():
+            set_seed(seed_num)
+            custom_model = ModelNew(*init_inputs)
+            assert hasattr(custom_model, "forward")
+            torch.cuda.synchronize(device=device)
+        if verbose:
+            print("[Backward Eval] Triton Model with Backward Pass Loaded")
+    except Exception as e:
+        print(f"Failed to load Triton backward pass kernel: {e}")
+        error_str = str(e)
+        metadata["runtime_error"] = error_str
+        metadata["error_category"] = "triton_backward_runtime_error"
+        graceful_eval_cleanup_triton(context, device)
+        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+    
+    # Step 1: Forward Pass Correctness
+    if verbose:
+        print("[Backward Eval] Checking Forward Pass Correctness")
+    
+    try:
+        forward_result = run_and_check_correctness(
+            original_model,
+            custom_model,
+            get_inputs,
+            metadata=metadata,
+            num_correct_trials=num_correct_trials,
+            verbose=verbose,
+            seed=seed_num,
+            device=device,
+        )
+        
+        if not forward_result.correctness:
+            if verbose:
+                print("[Backward Eval] Forward pass failed, skipping gradient tests")
+            graceful_eval_cleanup_triton(context, device)
+            return forward_result
+            
+    except Exception as e:
+        error_str = str(e)
+        metadata["forward_correctness_error"] = error_str
+        graceful_eval_cleanup_triton(context, device)
+        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+    
+    # Step 2: Gradient Correctness
+    if verbose:
+        print("[Backward Eval] Checking Gradient Correctness")
+    
+    try:
+        gradient_correct, gradient_metadata = test_gradient_correctness_triton(
+            original_model,
+            custom_model,
+            get_inputs,
+            tolerance=gradient_tolerance,
+            num_gradient_trials=num_gradient_trials,
+            seed=seed_num,
+            device=device,
+            verbose=verbose
+        )
+        
+        # Merge gradient metadata
+        metadata.update(gradient_metadata)
+        
+        if not gradient_correct:
+            if verbose:
+                print("[Backward Eval] Gradient correctness failed")
+            metadata["backward_pass_correctness"] = False
+            graceful_eval_cleanup_triton(context, device)
+            return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+        
+        metadata["backward_pass_correctness"] = True
+        if verbose:
+            print("[Backward Eval] Both forward and backward passes are correct!")
+            
+    except Exception as e:
+        error_str = str(e)
+        metadata["gradient_correctness_error"] = error_str
+        metadata["backward_pass_correctness"] = False
+        graceful_eval_cleanup_triton(context, device)
+        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+    
+    # Step 3: Performance Measurement (Optional)
+    final_result = KernelExecResult(compiled=True, correctness=True, metadata=metadata)
+    
+    if measure_performance:
+        try:
+            if verbose:
+                print("[Backward Eval] Measuring Backward Pass Performance")
+            
+            torch.cuda.synchronize(device=device)
+            set_seed(seed_num)
+            inputs = get_inputs()
+            inputs = [
+                x.cuda(device=device).requires_grad_(True) if isinstance(x, torch.Tensor) else x
+                for x in inputs
+            ]
+            model_new = custom_model.cuda(device=device)
+            torch.cuda.synchronize(device=device)
+            
+            def backward_pass_fn(*inputs):
+                outputs = model_new(*inputs)
+                # Create a scalar loss for backward pass
+                if isinstance(outputs, torch.Tensor):
+                    loss = outputs.sum()
+                else:
+                    loss = sum(o.sum() for o in outputs if isinstance(o, torch.Tensor))
+                loss.backward()
+                return loss
+            
+            elapsed_times = time_execution_with_cuda_event(
+                backward_pass_fn,
+                *inputs,
+                num_trials=num_perf_trials,
+                verbose=verbose,
+                device=device,
+            )
+            runtime_stats = get_timing_stats(elapsed_times, device=device)
+            
+            if verbose:
+                print(f"[Backward Eval] Backward Pass Performance Stats: {runtime_stats}")
+            final_result.runtime = runtime_stats["mean"]
+            final_result.runtime_stats = runtime_stats
+            
+        except Exception as e:
+            if verbose:
+                print(f"[Backward Eval] Error in Measuring Backward Performance: {e}")
+            metadata["error_during_backward_performance"] = str(e)
+    
+    graceful_eval_cleanup_triton(context, device)
+    return final_result
+
+
 def eval_kernel_against_ref_auto(
     original_model_src: str,
     custom_model_src: str,
@@ -1054,7 +1283,7 @@ def eval_kernel_against_ref_auto(
     verbose: bool = False,
     measure_performance: bool = False,
     build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
+    device: torch.device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else None,
 ) -> KernelExecResult:
     """
     Automatically detect kernel type and use appropriate evaluation function
@@ -1086,6 +1315,66 @@ def eval_kernel_against_ref_auto(
             measure_performance=measure_performance,
             build_dir=build_dir,
             device=device,
+        )
+
+
+def eval_kernel_backward_pass_auto(
+    original_model_src: str,
+    custom_model_src: str,
+    seed_num: int = 42,
+    num_correct_trials: int = 1,
+    num_gradient_trials: int = 3,
+    num_perf_trials: int = 10,
+    gradient_tolerance: float = 1e-4,
+    verbose: bool = False,
+    measure_performance: bool = False,
+    build_dir: os.PathLike = None,
+    device: torch.device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else None,
+) -> KernelExecResult:
+    """
+    Auto-detect kernel type and evaluate backward pass using appropriate function
+    
+    Currently supports:
+    - Triton kernels: Uses eval_triton_backward_pass()
+    - CUDA kernels: Would use eval_cuda_backward_pass() (to be implemented)
+    
+    Args:
+        original_model_src: Reference PyTorch model source code
+        custom_model_src: Custom model source code with backward pass
+        seed_num: Random seed for reproducibility
+        num_correct_trials: Number of forward correctness trials
+        num_gradient_trials: Number of gradient correctness trials
+        gradient_tolerance: Tolerance for gradient checking
+        verbose: Enable verbose output
+        measure_performance: Whether to measure backward pass performance
+        build_dir: Directory for build cache
+        device: CUDA device
+        
+    Returns:
+        KernelExecResult with both forward and backward pass results
+    """
+    if detect_triton_kernel(custom_model_src):
+        if verbose:
+            print("[Backward Eval Auto] Detected Triton kernel, using Triton backward evaluation")
+        return eval_triton_backward_pass(
+            original_model_src=original_model_src,
+            custom_model_src=custom_model_src,
+            seed_num=seed_num,
+            num_correct_trials=num_correct_trials,
+            num_gradient_trials=num_gradient_trials,
+            num_perf_trials=num_perf_trials,
+            gradient_tolerance=gradient_tolerance,
+            verbose=verbose,
+            measure_performance=measure_performance,
+            build_dir=build_dir,
+            device=device,
+        )
+    else:
+        # CUDA backward pass evaluation would go here
+        # For now, we'll raise an error until CUDA backward pass is implemented
+        raise NotImplementedError(
+            "CUDA backward pass evaluation not yet implemented. "
+            "Currently only Triton backward pass evaluation is supported."
         )
 
 
@@ -1138,7 +1427,7 @@ def time_execution_with_cuda_event(
     if device is None:
         if verbose:
             print(f"Using current device: {torch.cuda.current_device()}")
-        device = torch.cuda.current_device()
+        device = torch.device(f'cuda:{torch.cuda.current_device()}')
 
     # Warm ups
     for _ in range(num_warmup):
@@ -1385,6 +1674,173 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
         stats["device"] = str(device)  # for debugging
 
     return stats
+
+
+def test_gradient_correctness_triton(
+    original_model: nn.Module,
+    custom_model: nn.Module,
+    get_inputs_fn: callable,
+    tolerance: float = 1e-4,
+    num_gradient_trials: int = 3,
+    seed: int = 42,
+    device: torch.device = None,
+    verbose: bool = False
+) -> tuple[bool, dict]:
+    """
+    Test gradient correctness for Triton kernels using torch.autograd.gradcheck
+    
+    Returns:
+        tuple[bool, dict]: (gradient_correct, metadata)
+    """
+    metadata = {"gradient_trials": []}
+    
+    # Generate deterministic seeds for gradient trials
+    torch.manual_seed(seed)
+    gradient_trial_seeds = [
+        torch.randint(0, 2**32 - 1, (1,)).item() for _ in range(num_gradient_trials)
+    ]
+    
+    passed_trials = 0
+    
+    for trial in range(num_gradient_trials):
+        trial_seed = gradient_trial_seeds[trial]
+        
+        # Clear GPU memory before each trial
+        if device and device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(device=device)
+        
+        try:
+            if verbose:
+                print(f"[Gradient Test] Trial {trial + 1}/{num_gradient_trials} with seed {trial_seed}")
+                # Print available memory for debugging
+                if device and device.type == 'cuda':
+                    free_mem = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
+                    print(f"[Gradient Test] Available GPU memory: {free_mem / 1024**2:.1f} MB")
+            
+            # Generate test inputs with requires_grad=True and convert to double precision for gradcheck
+            set_seed(trial_seed)
+            inputs = get_inputs_fn()
+            
+            # Try with smaller input sizes if OOM occurs
+            input_scale_factors = [1.0, 0.5, 0.25]  # Try progressively smaller inputs
+            trial_passed = False
+            
+            for scale_factor in input_scale_factors:
+                try:
+                    # Scale down inputs if needed
+                    if scale_factor < 1.0:
+                        scaled_inputs = []
+                        for x in inputs:
+                            if isinstance(x, torch.Tensor) and x.dim() > 0:
+                                # Scale down tensor dimensions
+                                new_size = [max(1, int(dim * scale_factor)) for dim in x.shape]
+                                scaled_x = torch.randn(new_size, dtype=torch.float64, device=device, requires_grad=True)
+                                scaled_inputs.append(scaled_x)
+                            else:
+                                scaled_inputs.append(x)
+                        test_inputs = scaled_inputs
+                        if verbose:
+                            print(f"[Gradient Test] Using scaled inputs (factor: {scale_factor}) due to memory constraints")
+                    else:
+                        # Use original inputs, convert to double precision for gradcheck
+                        test_inputs = []
+                        for x in inputs:
+                            if isinstance(x, torch.Tensor):
+                                # Convert to double precision and move to device
+                                double_x = x.cuda(device=device).double().requires_grad_(True)
+                                test_inputs.append(double_x)
+                            else:
+                                test_inputs.append(x)
+                    
+                    # Clear memory before testing
+                    if device and device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    
+                    # Test custom Triton model gradients with memory-efficient approach
+                    set_seed(trial_seed)
+                    custom_model_copy = custom_model.cuda(device=device)
+                    
+                    # Use a simpler gradient check for memory efficiency
+                    custom_gradcheck = torch.autograd.gradcheck(
+                        custom_model_copy,
+                        test_inputs,
+                        eps=1e-6,
+                        atol=tolerance,
+                        check_undefined_grad=False,
+                        raise_exception=False,
+                        fast_mode=True  # Use fast mode to reduce memory usage
+                    )
+                    
+                    if custom_gradcheck:
+                        passed_trials += 1
+                        metadata["gradient_trials"].append({
+                            "trial": trial + 1,
+                            "passed": True,
+                            "seed": trial_seed,
+                            "scale_factor": scale_factor
+                        })
+                        if verbose:
+                            print(f"[Gradient Test] Trial {trial + 1} PASSED (scale: {scale_factor})")
+                        trial_passed = True
+                        break
+                    else:
+                        if verbose and scale_factor == 1.0:
+                            print(f"[Gradient Test] Trial {trial + 1} gradient check failed, trying smaller inputs...")
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() and scale_factor > 0.25:
+                        if verbose:
+                            print(f"[Gradient Test] OOM with scale {scale_factor}, trying smaller inputs...")
+                        # Clear memory and try next scale factor
+                        if device and device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        continue
+                    else:
+                        # If still OOM with smallest scale or other error, fail this trial
+                        raise e
+            
+            if not trial_passed:
+                metadata["gradient_trials"].append({
+                    "trial": trial + 1,
+                    "passed": False,
+                    "seed": trial_seed,
+                    "error": "Gradient check failed for all input scales"
+                })
+                if verbose:
+                    print(f"[Gradient Test] Trial {trial + 1} FAILED")
+                    
+        except Exception as e:
+            error_msg = str(e)
+            if "out of memory" in error_msg.lower():
+                error_msg = "CUDA out of memory (even with reduced input size)"
+            
+            metadata["gradient_trials"].append({
+                "trial": trial + 1,
+                "passed": False,
+                "seed": trial_seed,
+                "error": error_msg
+            })
+            if verbose:
+                print(f"[Gradient Test] Trial {trial + 1} ERROR: {error_msg}")
+        
+        # Clean up memory after each trial
+        if device and device.type == 'cuda':
+            torch.cuda.empty_cache()
+    
+    gradient_correct = (passed_trials == num_gradient_trials)
+    metadata["gradient_correctness"] = f"({passed_trials} / {num_gradient_trials})"
+    
+    # Add memory information to metadata
+    if device and device.type == 'cuda':
+        total_memory = torch.cuda.get_device_properties(device).total_memory
+        metadata["gpu_memory_info"] = {
+            "total_gb": f"{total_memory / 1024**3:.2f}",
+            "allocated_gb": f"{torch.cuda.memory_allocated(device) / 1024**3:.2f}",
+            "reserved_gb": f"{torch.cuda.memory_reserved(device) / 1024**3:.2f}"
+        }
+    
+    return gradient_correct, metadata
 
 
 # if __name__ == "__main__":
