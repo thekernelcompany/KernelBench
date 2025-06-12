@@ -98,7 +98,7 @@ class ScriptConfig(Config):
 
         # Backward pass evaluation
         self.test_backward_pass = False  # Enable backward pass testing
-        self.num_gradient_trials = 3  # Number of gradient correctness trials
+        self.num_gradient_trials = 5  # Number of gradient correctness trials
         self.gradient_tolerance = 1e-4  # Tolerance for gradient checking
         self.measure_backward_performance = True  # Measure backward pass performance
 
