@@ -19,6 +19,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src import utils
+from src import device_utils
 
 REPO_TOP_PATH = os.path.abspath(
     os.path.join(
@@ -325,9 +326,9 @@ def graceful_eval_cleanup(curr_context: dict, device: torch.device):
         # does this help?
         torch.cuda.reset_peak_memory_stats(device=device)
 
-        torch.cuda.synchronize(
+        device_utils.synchronize(
             device=device
-        )  # Wait for all CUDA operations to complete
+        )  # Wait for all GPU operations to complete
 
     # _cleanup_cuda_extensions() # SIMON NOTE: is this necessary?
 
@@ -539,7 +540,7 @@ def eval_kernel_against_ref(
     verbose: bool = False,
     measure_performance: bool = False,
     build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None, # have to run on GPU
+    device: torch.device = device_utils.get_current_device() if device_utils.is_gpu_available() else None, # have to run on GPU
 ) -> KernelExecResult:
     """
     Evaluate the custom kernel against the original model
@@ -583,7 +584,7 @@ def eval_kernel_against_ref(
     set_seed(seed_num)  # set seed for reproducible input
     init_inputs = get_init_inputs()
     init_inputs = [
-        x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
+        device_utils.to_device(x, device) if isinstance(x, torch.Tensor) else x for x in init_inputs
     ]
 
     with torch.no_grad():
@@ -729,7 +730,7 @@ def eval_kernel_against_ref(
                 set_seed(seed_num)
                 inputs = get_inputs()
                 inputs = [
-                    x.cuda(device=device) if isinstance(x, torch.Tensor) else x
+                    device_utils.to_device(x, device) if isinstance(x, torch.Tensor) else x
                     for x in inputs
                 ]
                 model_new = custom_model.cuda(device=device)
@@ -799,7 +800,7 @@ def eval_triton_kernel_against_ref(
     verbose: bool = False,
     measure_performance: bool = False,
     build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
+    device: torch.device = device_utils.get_current_device() if device_utils.is_gpu_available() else None,
 ) -> KernelExecResult:
     """
     Evaluate Triton kernel against the original model
@@ -809,19 +810,20 @@ def eval_triton_kernel_against_ref(
     num_perf_trials: run the evaluation many times to take the average
     device: GPU (cuda) device to run the evaluation on
     """
-    # Check device availability and status
-    assert torch.cuda.is_available(), "CUDA is not available, cannot run Triton kernels"
+    # Check device availability and status (supports both CUDA and ROCm)
+    assert device_utils.is_gpu_available(), "GPU is not available, cannot run Triton kernels"
     
     # Verify device is valid
     if device.type != 'cuda':
-        raise ValueError(f"Device must be CUDA device, got {device}")
+        platform = device_utils.get_platform()
+        raise ValueError(f"Device must be GPU device for {platform.upper()} platform, got {device}")
     
     # Check if device is accessible
     try:
-        torch.cuda.set_device(device)
-        torch.cuda.current_device()
+        device_utils.set_device(device)
+        device_utils.get_current_device()
     except Exception as e:
-        raise RuntimeError(f"Cannot access CUDA device {device}: {e}")
+        raise RuntimeError(f"Cannot access GPU device {device}: {e}")
     torch.set_printoptions(
         precision=4,  # Decimal places
         threshold=10,  # Total number of elements before truncating
@@ -829,8 +831,8 @@ def eval_triton_kernel_against_ref(
         linewidth=80,  # Maximum width before wrapping
     )
 
-    # set CUDA device
-    torch.cuda.set_device(device)
+    # set GPU device
+    device_utils.set_device(device)
 
     context = {}
 
@@ -844,7 +846,7 @@ def eval_triton_kernel_against_ref(
     set_seed(seed_num)  # set seed for reproducible input
     init_inputs = get_init_inputs()
     init_inputs = [
-        x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
+        device_utils.to_device(x, device) if isinstance(x, torch.Tensor) else x for x in init_inputs
     ]
 
     with torch.no_grad():
@@ -857,7 +859,8 @@ def eval_triton_kernel_against_ref(
         print("[Eval] Loading and Compiling Triton Kernel")
 
     metadata = {}  # for storing result metadata
-    metadata["hardware"] = torch.cuda.get_device_name(device=device)
+    metadata["platform"] = device_utils.get_platform()
+    metadata["hardware"] = device_utils.get_device_name(device=device)
     metadata["device"] = str(device)  # for debugging
     metadata["kernel_type"] = "triton"
 
@@ -867,7 +870,7 @@ def eval_triton_kernel_against_ref(
         os.environ["TRITON_PRINT_AUTOTUNING"] = "0"  # reduce noise during eval
         # add hash for later to distinguish between multi-turn kernels
         ModelNew = load_custom_model_triton(custom_model_src, context, build_dir)
-        torch.cuda.synchronize(device=device)  # not sure if this is too much
+        device_utils.synchronize(device=device)  # not sure if this is too much
     except Exception as e:
         print(
             f"Failed to compile Triton kernel: Record as compilation failure. \nError: {e}"
@@ -915,7 +918,7 @@ def eval_triton_kernel_against_ref(
             set_seed(seed_num)  # set seed for reproducible weights
             custom_model = ModelNew(*init_inputs)
             assert hasattr(custom_model, "forward")
-            torch.cuda.synchronize(device=device)
+            device_utils.synchronize(device=device)
         if verbose:
             print("[Eval] Triton Model Loaded")
     except RuntimeError as e:
@@ -1013,15 +1016,15 @@ def eval_triton_kernel_against_ref(
                 if verbose:
                     print("[Eval] Measuring Performance as Triton kernel is Correct")
 
-                torch.cuda.synchronize(device=device)
+                device_utils.synchronize(device=device)
                 set_seed(seed_num)
                 inputs = get_inputs()
                 inputs = [
-                    x.cuda(device=device) if isinstance(x, torch.Tensor) else x
+                    device_utils.to_device(x, device) if isinstance(x, torch.Tensor) else x
                     for x in inputs
                 ]
                 model_new = custom_model.cuda(device=device)
-                torch.cuda.synchronize(device=device)
+                device_utils.synchronize(device=device)
 
                 elapsed_times = time_execution_with_cuda_event(
                     model_new,
@@ -1054,7 +1057,7 @@ def eval_kernel_against_ref_auto(
     verbose: bool = False,
     measure_performance: bool = False,
     build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
+    device: torch.device = device_utils.get_current_device() if device_utils.is_gpu_available() else None,
 ) -> KernelExecResult:
     """
     Automatically detect kernel type and use appropriate evaluation function
@@ -1123,48 +1126,60 @@ def time_execution_with_cuda_event(
     device: torch.device = None,
 ) -> list[float]:
     """
-    Time a CUDA kernel function over multiple trials using torch.cuda.Event
+    Time a GPU kernel function over multiple trials using GPU events (works with both CUDA and ROCm)
 
     Args:
         kernel_fn: Function to time
         *args: Arguments to pass to kernel_fn
         num_trials: Number of timing trials to run
         verbose: Whether to print per-trial timing info
-        device: CUDA device to use, if None, use current device
+        device: GPU device to use, if None, use current device
 
     Returns:
         List of elapsed times in milliseconds
     """
     if device is None:
         if verbose:
-            print(f"Using current device: {torch.cuda.current_device()}")
-        device = torch.cuda.current_device()
+            print(f"Using current device: {device_utils.get_current_device()}")
+        device = device_utils.get_current_device()
 
     # Warm ups
     for _ in range(num_warmup):
         kernel_fn(*args)
-        torch.cuda.synchronize(device=device)
+        device_utils.synchronize(device=device)
 
     print(
-        f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
+        f"[Profiling] Using device: {device} {device_utils.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
     )
     elapsed_times = []
 
     # Actual trials
     for trial in range(num_trials):
         # create event marker default is not interprocess
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        start_event = device_utils.create_event(enable_timing=True)
+        end_event = device_utils.create_event(enable_timing=True)
 
-        start_event.record()
-        kernel_fn(*args)
-        end_event.record()
+        if start_event is not None and end_event is not None:
+            # Use GPU events for timing (both CUDA and ROCm)
+            start_event.record()
+            kernel_fn(*args)
+            end_event.record()
 
-        # Synchronize to ensure the events have completed
-        torch.cuda.synchronize(device=device)
+            # Synchronize to ensure the events have completed
+            device_utils.synchronize(device=device)
 
-        # Calculate the elapsed time in milliseconds
-        elapsed_time_ms = start_event.elapsed_time(end_event)
+            # Calculate the elapsed time in milliseconds
+            elapsed_time_ms = start_event.elapsed_time(end_event)
+        else:
+            # Fallback to CPU timing if GPU events are not available
+            import time
+            device_utils.synchronize(device=device)
+            start_time = time.perf_counter()
+            kernel_fn(*args)
+            device_utils.synchronize(device=device)
+            end_time = time.perf_counter()
+            elapsed_time_ms = (end_time - start_time) * 1000.0  # Convert to milliseconds
+
         if verbose:
             print(f"Trial {trial + 1}: {elapsed_time_ms:.3g} ms")
         elapsed_times.append(elapsed_time_ms)
@@ -1208,7 +1223,7 @@ def run_and_check_correctness(
             set_seed(trial_seed)
             inputs = get_inputs_fn()
             inputs = [
-                x.cuda(device=device) if isinstance(x, torch.Tensor) else x
+                device_utils.to_device(x, device) if isinstance(x, torch.Tensor) else x
                 for x in inputs
             ]
 
@@ -1219,12 +1234,12 @@ def run_and_check_correctness(
             model_new = new_model_instance.cuda(device=device)
 
             output = model(*inputs)
-            torch.cuda.synchronize(device=device)
+            device_utils.synchronize(device=device)
             # ensure all GPU operations are completed before checking results
 
             try:
                 output_new = model_new(*inputs)
-                torch.cuda.synchronize(device=device)
+                device_utils.synchronize(device=device)
                 if output.shape != output_new.shape:
                     metadata = register_and_format_exception(
                         "correctness_issue",
@@ -1366,7 +1381,7 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
 
     Args:
         elapsed_times: List of elapsed times in milliseconds
-        device: CUDA device, record device info
+        device: GPU device, record device info
     Returns:
         Dict containing mean, std, min, max and num_trials
         all timing are in ms
@@ -1381,7 +1396,7 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
     }
 
     if device:
-        stats["hardware"] = torch.cuda.get_device_name(device=device)
+        stats["hardware"] = device_utils.get_device_name(device=device)
         stats["device"] = str(device)  # for debugging
 
     return stats

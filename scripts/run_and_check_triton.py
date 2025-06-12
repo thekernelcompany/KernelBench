@@ -16,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src import eval as kernel_eval
 from src import utils as kernel_utils
+from src import device_utils
 from src.utils import read_file
 
 # Import measure_program_time from generate_baseline_time
@@ -81,8 +82,8 @@ class ScriptConfig(Config):
         self.build_dir_prefix = "" # if you want to specify a custom build directory
         self.clear_cache = False # TODO
 
-        # Replace with your NVIDIA GPU architecture, e.g. ["Hopper"]
-        self.gpu_arch = ["Ada"] 
+        # Replace with your GPU architecture, e.g. ["Hopper"] for NVIDIA, ["RDNA3"] for AMD
+        self.gpu_arch = ["Ada"]  # Will be auto-detected based on available hardware 
 
     def __repr__(self):
         return f"ScriptConfig({self.to_dict()})"
@@ -152,20 +153,25 @@ def evaluate_single_sample_src(ref_arch_src: str, kernel_src: str, configs: dict
         return eval_result
     except Exception as e:
         print(f"[WARNING] Last level catch: Some issue evaluating for kernel: {e} ")
-        if "CUDA error" in str(e): 
+        platform = device_utils.get_platform()
+        if "CUDA error" in str(e) or "HIP error" in str(e): 
             # NOTE: count this as compilation failure as it is not runnable code
-            metadata = {"cuda_error": f"CUDA Error: {str(e)}",
-                        "hardware": torch.cuda.get_device_name(device=device),
-                        "device": str(device)
-                        }
+            metadata = {
+                "gpu_error": f"{platform.upper()} Error: {str(e)}",
+                "platform": platform,
+                "hardware": device_utils.get_device_name(device=device),
+                "device": str(device)
+            }
             eval_result = kernel_eval.KernelExecResult(compiled=False, correctness=False, 
                                                 metadata=metadata)
             return eval_result
         else:
-            metadata = {"other_error": f"error: {str(e)}",
-                        "hardware": torch.cuda.get_device_name(device=device),
-                        "device": str(device)
-                        }
+            metadata = {
+                "other_error": f"error: {str(e)}",
+                "platform": platform,
+                "hardware": device_utils.get_device_name(device=device),
+                "device": str(device)
+            }
             eval_result = kernel_eval.KernelExecResult(compiled=False, correctness=False, 
                                                 metadata=metadata)
             return eval_result
@@ -214,8 +220,21 @@ def main(config: ScriptConfig):
         kernel_type = "Triton" if is_triton else "CUDA"
         print(f"[INFO] Auto-detected kernel type: {kernel_type}")
 
-    # Start Evaluation
-    device = torch.device("cuda:0") # default device
+    # Start Evaluation - Validate GPU setup
+    gpu_status = device_utils.validate_gpu_setup()
+    if not gpu_status["valid"]:
+        print(f"[ERROR] {gpu_status['message']}")
+        print(f"[INFO] Platform detected: {gpu_status['platform']}")
+        if gpu_status['platform'] != 'cpu':
+            print(f"[INFO] Backend info: {gpu_status['device_info']}")
+        return
+    
+    # Display platform information
+    platform_summary = device_utils.get_platform_summary()
+    device = device_utils.get_default_device()
+    print(f"[INFO] Platform: {platform_summary}")
+    print(f"[INFO] PyTorch device: {device} (internal compatibility layer)")
+    
     kernel_utils.set_gpu_arch(config.gpu_arch)
 
     print("[INFO] Evaluating kernel against reference code")
