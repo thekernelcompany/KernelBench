@@ -1,6 +1,6 @@
 # 🚀 Modal Triton Automation - Usage Guide
 
-This document explains how to use the Modal-based automation for running Triton kernel evaluations on cloud GPUs.
+This document explains how to use the Modal-based automation for running Triton kernel evaluations on cloud GPUs, including **forward and backward pass testing**.
 
 ## 📋 Prerequisites
 
@@ -33,7 +33,20 @@ python run_triton_modal.py --kernel my_triton_kernel.py --level 1 --problem_id 3
 python run_triton_modal.py --kernel my_triton_kernel.py --reference my_reference.py
 ```
 
-### 3. Advanced Options
+### 3. Backward Pass Evaluation
+
+```bash
+# Evaluate forward and backward pass
+python run_triton_modal.py --kernel my_triton_kernel.py --level 1 --problem_id 3 --test_backward_pass
+
+# Backward pass with custom gradient settings
+python run_triton_modal.py --kernel my_triton_kernel.py --level 1 --problem_id 3 \
+    --test_backward_pass \
+    --num_gradient_trials 5 \
+    --gradient_tolerance 1e-5
+```
+
+### 4. Advanced Options
 
 ```bash
 # Full production evaluation with custom settings
@@ -44,7 +57,8 @@ python run_triton_modal.py \
     --num_correct_trials 10 \
     --num_perf_trials 200 \
     --gpu H100 \
-    --verbose
+    --verbose \
+    --test_backward_pass
 ```
 
 ## 🔧 Command Line Options
@@ -60,11 +74,16 @@ python run_triton_modal.py \
 | `--num_correct_trials` | Number of correctness trials | 5 |
 | `--num_perf_trials` | Number of performance trials | 100 |
 | `--verbose` | Enable verbose output | False |
+| `--test_backward_pass` | Enable backward pass testing | False |
+| `--num_gradient_trials` | Number of gradient correctness trials | 3 |
+| `--gradient_tolerance` | Tolerance for gradient checking | 1e-4 |
+| `--measure_backward_performance` | Enable backward pass performance measurement | True |
 
 ## 📁 File Structure
 
 Your Triton kernel should follow this structure:
 
+**Forward Pass Only:**
 ```python
 import torch
 import torch.nn as nn
@@ -86,6 +105,39 @@ class ModelNew(nn.Module):
 
     def forward(self, *inputs):
         return my_function(*inputs)
+```
+
+**Forward + Backward Pass:**
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def forward_kernel(...):
+    # Forward Triton kernel implementation
+    pass
+
+@triton.jit
+def backward_kernel(...):
+    # Backward Triton kernel implementation
+    pass
+
+class CustomTritonFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        return triton_forward_function(input)
+    
+    @staticmethod 
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        return triton_backward_function(grad_output, input)
+
+class ModelNew(nn.Module):
+    def forward(self, *inputs):
+        return CustomTritonFunction.apply(*inputs)
 ```
 
 ## 🏁 Example Workflow
@@ -117,18 +169,22 @@ class ModelNew(nn.Module):
 ### Step 2: Test Against KernelBench
 
 ```bash
-# Quick test first
+# Quick test first (forward pass only)
 python run_triton_modal.py --kernel my_matmul_kernel.py --level 1 --problem_id 1 --quick
 
 # If it passes, run full evaluation
 python run_triton_modal.py --kernel my_matmul_kernel.py --level 1 --problem_id 1 --verbose
+
+# Test backward pass (if your kernel supports it)
+python run_triton_modal.py --kernel my_matmul_kernel.py --level 1 --problem_id 1 --test_backward_pass --verbose
 ```
 
 ### Step 3: Check Results
 
-You'll see output like:
+**Forward Pass Only:**
 ```
 🚀 Starting Triton evaluation on H100
+➡️ Mode: Forward Pass Only
 📄 Kernel: my_matmul_kernel.py
 📚 Reference: KernelBench Level 1, Problem 1
 🔧 Trials: 5 correctness, 100 performance
@@ -141,6 +197,30 @@ Kernel Type: Triton
 ✅ Compiled: True
 ✅ Correctness: True
 ⚡ Runtime: 0.245 ms
+```
+
+**Forward + Backward Pass:**
+```
+🚀 Starting Triton evaluation on H100
+🔄 Mode: Forward + Backward Pass Evaluation
+📄 Kernel: my_matmul_kernel.py
+📚 Reference: KernelBench Level 1, Problem 1
+🔧 Trials: 5 correctness, 100 performance
+🔧 Gradient Trials: 3, Tolerance: 0.0001
+
+========================================
+📊 EVALUATION RESULTS (WITH BACKWARD PASS)
+========================================
+Problem: 1_Square_matrix_multiplication_.py
+Kernel Type: Triton
+✅ Compiled: True
+✅ Forward Pass Correctness: True
+✅ Backward Pass: True
+✅ Gradient Correctness: (3 / 3)
+⚡ Forward Runtime: 0.245 ms
+⚡ Backward Runtime: 0.198 ms
+🚀 Forward Speedup over PyTorch Eager: 1.23x
+🚀 Backward Speedup over torch.compile: 1.82x
 ```
 
 ## 🎛️ GPU Selection
@@ -169,17 +249,31 @@ python run_triton_modal.py --kernel my_kernel.py --level 1 --problem_id 1 --verb
 
 ## 📊 Understanding Results
 
-### Success Output
+### Forward Pass Only Results
 ```
 ✅ Compiled: True     # Kernel compiled successfully
 ✅ Correctness: True  # All correctness trials passed
 ⚡ Runtime: 0.245 ms  # Average runtime
 ```
 
+### Forward + Backward Pass Results
+```
+✅ Compiled: True                    # Kernel compiled successfully
+✅ Forward Pass Correctness: True    # Forward pass correctness
+✅ Backward Pass: True              # Backward pass correctness
+✅ Gradient Correctness: (3 / 3)    # Gradient trials passed
+⚡ Forward Runtime: 0.245 ms        # Forward pass timing
+⚡ Backward Runtime: 0.198 ms       # Backward pass timing
+🚀 Forward Speedup over PyTorch Eager: 1.23x
+🚀 Forward Speedup over torch.compile: 1.15x
+🚀 Backward Speedup over PyTorch Eager: 1.67x
+🚀 Backward Speedup over torch.compile: 1.82x
+```
+
 ### Performance Comparison
 The system automatically compares against:
-- PyTorch eager execution
-- `torch.compile` baseline
+- PyTorch eager execution (forward and backward)
+- `torch.compile` baseline (forward and backward)
 - Reference implementation
 
 ### Error Categorization
@@ -217,11 +311,19 @@ modal run --mount .:/workspace modal_triton_automation.py \
 
 ## 💡 Tips for Success
 
+### General Tips
 1. **Start Small**: Use `--quick` for initial testing
 2. **Check Examples**: Look at `TRITON_INTEGRATION_GUIDE.md` for working examples
 3. **GPU Choice**: H100 for performance, L40S for cost-effectiveness
 4. **Verbose Mode**: Use `--verbose` for detailed debugging information
 5. **Incremental Testing**: Test simple operations before complex kernels
+
+### Backward Pass Tips
+6. **Test Forward First**: Always verify forward pass works before adding backward pass
+7. **Use torch.autograd.Function**: Required for proper gradient integration
+8. **Save Required Tensors**: Use `ctx.save_for_backward()` for tensors needed in backward pass
+9. **Gradient Tolerance**: Start with default `1e-4`, tighten to `1e-5` or `1e-6` for higher precision
+10. **Memory Management**: Backward pass doubles memory usage, consider smaller batch sizes for testing
 
 ## 🔗 Related Documentation
 
@@ -231,4 +333,4 @@ modal run --mount .:/workspace modal_triton_automation.py \
 
 ---
 
-*This automation system provides a production-ready way to evaluate Triton kernels against KernelBench with minimal setup and maximum flexibility.* 
+*This automation system provides a production-ready way to evaluate Triton kernels against KernelBench with **full forward and backward pass support**, minimal setup and maximum flexibility.* 

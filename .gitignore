@@ -4,6 +4,7 @@ scratch/
 *.egg-info/
 **build/
 **dist/
+modal_results/*
 # **results/
 results/*
 runs/*
