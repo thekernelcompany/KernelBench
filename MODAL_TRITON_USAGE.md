@@ -1,6 +1,6 @@
 # 🚀 Modal Triton Automation - Usage Guide
 
-This document explains how to use the Modal-based automation for running Triton kernel evaluations on cloud GPUs, including **forward and backward pass testing**.
+This document explains how to use the Modal-based automation for running Triton kernel evaluations on cloud GPUs. The Modal scripts now produce **exactly the same terminal output** as running locally, including **forward and backward pass testing** with identical formatting.
 
 ## 📋 Prerequisites
 
@@ -181,46 +181,74 @@ python run_triton_modal.py --kernel my_matmul_kernel.py --level 1 --problem_id 1
 
 ### Step 3: Check Results
 
+The Modal scripts now produce **exactly the same terminal output** as running locally! You'll see:
+
 **Forward Pass Only:**
 ```
 🚀 Starting Triton evaluation on H100
 ➡️ Mode: Forward Pass Only
 📄 Kernel: my_matmul_kernel.py
 📚 Reference: KernelBench Level 1, Problem 1
-🔧 Trials: 5 correctness, 100 performance
 
-========================================
-📊 EVALUATION RESULTS
-========================================
-Problem: 1_Square_matrix_multiplication_.py
-Kernel Type: Triton
-✅ Compiled: True
-✅ Correctness: True
-⚡ Runtime: 0.245 ms
+Running with config ScriptConfig({'ref_origin': 'kernelbench', 'level': 1, 'problem_id': 1, ...})
+Filter: 100%|████████████████████████| 100/100 [00:00<00:00, 31455.71 examples/s]
+Fetched problem 1 from KernelBench level 1: 1_Square_matrix_multiplication_
+[INFO] Auto-detected kernel type: Triton
+[INFO] Evaluating kernel against reference code
+[Eval] Detected Triton kernel, using Triton evaluation
+[Eval] Start Triton Evaluation! on device: cuda:0
+...
+============================================================
+[FORWARD PASS RESULTS]
+============================================================
+[Eval] triton kernel eval result: compiled=True correctness=True runtime=0.245ms
+------------------------------------------------------------
+[Timing] PyTorch Reference Eager exec time: 0.189 ms
+[Timing] PyTorch Reference torch.compile time: 0.213 ms
+[Timing] Custom triton Kernel exec time: 0.245 ms
+------------------------------------------------------------
+[Speedup] Forward Speedup over eager: 1.23x
+[Speedup] Forward Speedup over torch.compile: 1.15x
+============================================================
 ```
 
 **Forward + Backward Pass:**
 ```
 🚀 Starting Triton evaluation on H100
 🔄 Mode: Forward + Backward Pass Evaluation
-📄 Kernel: my_matmul_kernel.py
-📚 Reference: KernelBench Level 1, Problem 1
-🔧 Trials: 5 correctness, 100 performance
-🔧 Gradient Trials: 3, Tolerance: 0.0001
 
-========================================
-📊 EVALUATION RESULTS (WITH BACKWARD PASS)
-========================================
-Problem: 1_Square_matrix_multiplication_.py
-Kernel Type: Triton
-✅ Compiled: True
-✅ Forward Pass Correctness: True
-✅ Backward Pass: True
-✅ Gradient Correctness: (3 / 3)
-⚡ Forward Runtime: 0.245 ms
-⚡ Backward Runtime: 0.198 ms
-🚀 Forward Speedup over PyTorch Eager: 1.23x
-🚀 Backward Speedup over torch.compile: 1.82x
+Running with config ScriptConfig({'ref_origin': 'kernelbench', 'test_backward_pass': True, ...})
+Filter: 100%|████████████████████████| 100/100 [00:00<00:00, 31455.71 examples/s]
+Fetched problem 19 from KernelBench level 1: 19_ReLU
+[INFO] Auto-detected kernel type: Triton
+[INFO] Evaluating kernel against reference code
+...
+============================================================
+[FORWARD PASS RESULTS]
+============================================================
+[Eval] triton kernel eval result: compiled=True correctness=True runtime=0.0687ms
+------------------------------------------------------------
+[Timing] PyTorch Reference Eager exec time: 0.0273 ms
+[Timing] PyTorch Reference torch.compile time: 0.065 ms
+[Timing] Custom triton Kernel exec time: 0.0687 ms
+------------------------------------------------------------
+[Speedup] Forward Speedup over eager: 0.40x
+[Speedup] Forward Speedup over torch.compile: 0.95x
+
+============================================================
+[BACKWARD PASS RESULTS]
+============================================================
+[Eval] triton backward pass result: compiled=True correctness=True runtime=0.276ms
+[Correctness] Gradient trials: (5 / 5)
+[Correctness] Overall backward pass: ✅ PASS
+------------------------------------------------------------
+[Timing] PyTorch Reference Backward Eager time: 0.233 ms
+[Timing] PyTorch Reference Backward torch.compile time: 0.515 ms
+[Timing] Custom triton Backward Kernel time: 0.276 ms
+------------------------------------------------------------
+[Speedup] Backward Speedup over eager: 0.85x
+[Speedup] Backward Speedup over torch.compile: 1.87x
+============================================================
 ```
 
 ## 🎛️ GPU Selection
@@ -249,25 +277,47 @@ python run_triton_modal.py --kernel my_kernel.py --level 1 --problem_id 1 --verb
 
 ## 📊 Understanding Results
 
-### Forward Pass Only Results
+The Modal scripts now output **exactly the same format** as running locally. Here's what to look for:
+
+### Configuration and Setup
 ```
-✅ Compiled: True     # Kernel compiled successfully
-✅ Correctness: True  # All correctness trials passed
-⚡ Runtime: 0.245 ms  # Average runtime
+Running with config ScriptConfig({'ref_origin': 'kernelbench', ...})
+Filter: 100%|████████████████████████| 100/100 [00:00<00:00, 31455.71 examples/s]
+Fetched problem 19 from KernelBench level 1: 19_ReLU
+[INFO] Auto-detected kernel type: Triton
 ```
 
-### Forward + Backward Pass Results
+### Forward Pass Results Section
 ```
-✅ Compiled: True                    # Kernel compiled successfully
-✅ Forward Pass Correctness: True    # Forward pass correctness
-✅ Backward Pass: True              # Backward pass correctness
-✅ Gradient Correctness: (3 / 3)    # Gradient trials passed
-⚡ Forward Runtime: 0.245 ms        # Forward pass timing
-⚡ Backward Runtime: 0.198 ms       # Backward pass timing
-🚀 Forward Speedup over PyTorch Eager: 1.23x
-🚀 Forward Speedup over torch.compile: 1.15x
-🚀 Backward Speedup over PyTorch Eager: 1.67x
-🚀 Backward Speedup over torch.compile: 1.82x
+============================================================
+[FORWARD PASS RESULTS]
+============================================================
+[Eval] triton kernel eval result: compiled=True correctness=True runtime=0.0687ms
+------------------------------------------------------------
+[Timing] PyTorch Reference Eager exec time: 0.0273 ms
+[Timing] PyTorch Reference torch.compile time: 0.065 ms
+[Timing] Custom triton Kernel exec time: 0.0687 ms
+------------------------------------------------------------
+[Speedup] Forward Speedup over eager: 0.40x
+[Speedup] Forward Speedup over torch.compile: 0.95x
+```
+
+### Backward Pass Results Section (if enabled)
+```
+============================================================
+[BACKWARD PASS RESULTS]  
+============================================================
+[Eval] triton backward pass result: compiled=True correctness=True runtime=0.276ms
+[Correctness] Gradient trials: (5 / 5)
+[Correctness] Overall backward pass: ✅ PASS
+------------------------------------------------------------
+[Timing] PyTorch Reference Backward Eager time: 0.233 ms
+[Timing] PyTorch Reference Backward torch.compile time: 0.515 ms
+[Timing] Custom triton Backward Kernel time: 0.276 ms
+------------------------------------------------------------
+[Speedup] Backward Speedup over eager: 0.85x
+[Speedup] Backward Speedup over torch.compile: 1.87x
+============================================================
 ```
 
 ### Performance Comparison
@@ -275,6 +325,13 @@ The system automatically compares against:
 - PyTorch eager execution (forward and backward)
 - `torch.compile` baseline (forward and backward)
 - Reference implementation
+
+### Key Metrics to Watch
+- **Compilation**: Should show `compiled=True`
+- **Correctness**: Should show `correctness=True` 
+- **Gradient Trials**: Should show `(X / X)` where all trials pass
+- **Speedups**: Look for values > 1.0x for performance improvements
+- **Memory Usage**: GPU memory info is displayed for backward pass testing
 
 ### Error Categorization
 Errors are automatically categorized:
@@ -317,6 +374,7 @@ modal run --mount .:/workspace modal_triton_automation.py \
 3. **GPU Choice**: H100 for performance, L40S for cost-effectiveness
 4. **Verbose Mode**: Use `--verbose` for detailed debugging information
 5. **Incremental Testing**: Test simple operations before complex kernels
+6. **Terminal Output**: Modal now shows identical output to local execution - all the same progress bars, timing details, and result formatting
 
 ### Backward Pass Tips
 6. **Test Forward First**: Always verify forward pass works before adding backward pass

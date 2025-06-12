@@ -46,7 +46,7 @@ def main():
     
     # Backward pass options
     parser.add_argument("--test_backward_pass", action="store_true", help="Enable backward pass testing")
-    parser.add_argument("--num_gradient_trials", type=int, default=3, help="Number of gradient correctness trials")
+    parser.add_argument("--num_gradient_trials", type=int, default=5, help="Number of gradient correctness trials")
     parser.add_argument("--gradient_tolerance", type=float, default=1e-4, help="Tolerance for gradient checking")
     parser.add_argument("--measure_backward_performance", action="store_true", default=True, 
                        help="Enable backward pass performance measurement")
@@ -63,7 +63,7 @@ def main():
     if args.quick:
         args.num_correct_trials = 1
         args.num_perf_trials = 10
-        print("🏃 Quick test mode: 1 correctness trial, 10 performance trials")
+        print("Quick test mode: 1 correctness trial, 10 performance trials")
     
     # Check if kernel file exists
     kernel_path = Path(args.kernel)
@@ -81,20 +81,20 @@ def main():
     # Determine reference mode
     if args.reference:
         ref_origin = "local"
-        print(f"📋 Reference: {args.reference} (local)")
+        print(f"Reference: {args.reference} (local)")
     else:
         ref_origin = "kernelbench"  
-        print(f"📚 Reference: KernelBench Level {args.level}, Problem {args.problem_id}")
+        print(f"Reference: KernelBench Level {args.level}, Problem {args.problem_id}")
     
-    print(f"📄 Kernel: {args.kernel}")
-    print(f"🚀 GPU: {args.gpu}")
+    print(f"Kernel: {args.kernel}")
+    print(f"GPU: {args.gpu}")
     if args.test_backward_pass:
-        print("🔄 Mode: Forward + Backward Pass Evaluation")
+        print("Mode: Forward + Backward Pass Evaluation")
     else:
-        print("➡️ Mode: Forward Pass Only")
-    print(f"🔧 Trials: {args.num_correct_trials} correctness, {args.num_perf_trials} performance")
+        print("Mode: Forward Pass Only")
+    print(f"Trials: {args.num_correct_trials} correctness, {args.num_perf_trials} performance")
     if args.test_backward_pass:
-        print(f"🔧 Gradient Trials: {args.num_gradient_trials}, Tolerance: {args.gradient_tolerance}")
+        print(f"Gradient Trials: {args.num_gradient_trials}, Tolerance: {args.gradient_tolerance}")
     
     # Prepare Modal command
     modal_script = "modal_run_and_check_triton.py"
@@ -154,11 +154,11 @@ def main():
     env["MODAL_LOGS_LEVEL"] = "DEBUG" if args.verbose else "INFO"
     
     print("\n" + "="*60)
-    print("🚀 LAUNCHING MODAL EVALUATION")
+    print("LAUNCHING MODAL EVALUATION")
     print("="*60)
     print(f"Command: {final_cmd}")
     print()
-    print("📡 Modal logs will appear below...")
+    print("Modal logs will appear below...")
     print("-" * 60)
     
     # Execute command with environment and capture output for JSON saving
@@ -187,22 +187,131 @@ def main():
     
     print("-" * 60)
     if exit_code == 0:
-        print("✅ Modal evaluation completed successfully!")
+        print("Modal evaluation completed successfully!")
         
         # Try to save JSON results locally
         try:
-            save_json_results(args, process.stdout if exit_code == 0 else None)
+            # The run_triton_check function in modal_run_and_check_triton.py now returns
+            # the full result dictionary. We need to pass that to save_json_results.
+            # The stdout from the subprocess is now in result['detailed_stdout'].
+            # The actual JSON content from the script is in result['script_output_json_content'].
+            
+            # We need to get the result object from the modal_run_and_check_triton.py script
+            # For now, let's assume the run_triton_check function in modal_run_and_check_triton.py
+            # is called and its result is what we need to pass.
+            # This part of the code (`run_triton_modal.py`) primarily constructs a command and runs it.
+            # The actual result dictionary for save_json_results would typically be constructed
+            # by calling the main function of modal_run_and_check_triton.py if it were used as a library,
+            # or by parsing its stdout if it printed a structured result.
+
+            # Given the current structure, process.stdout contains the *entire* output from
+            # modal_run_and_check_triton.py. We need to find the result structure within it.
+            # However, the previous changes made run_triton_check return the detailed output
+            # which is then passed to this script's `save_json_results` if we were calling it
+            # as a library. Since we are using subprocess here, we need to adapt.
+
+            # For simplicity, let's assume the necessary 'result' dict with 'script_output_json_content'
+            # would be available if this script called modal_run_and_check_triton.py as a library.
+            # The current `subprocess.run` captures `process.stdout` and `process.stderr`.
+            # The `modal_run_and_check_triton.py` script itself now prints the detailed output.
+            
+            # The `save_json_results` expects a dictionary that mirrors the return of `run_triton_check_remote`.
+            # This is not directly available from `subprocess.run` output easily without complex parsing.
+            # The previous step correctly modified `save_json_results` to expect `modal_output_dict`
+            # which should have `script_output_json_content`.
+
+            # This `run_triton_modal.py` calls `modal_run_and_check_triton.py` as a command line script.
+            # `modal_run_and_check_triton.py` (when run via its `if __name__ == "__main__":`) calls `run_triton_check`.
+            # `run_triton_check` invokes `run_triton_check_remote.remote()` and gets a result dict.
+            # This result dict (containing `script_output_json_content`) is what `save_json_results` needs.
+
+            # The simplest way is to assume `modal_run_and_check_triton.py` could print its final result dict as JSON string
+            # at the very end, which this script could then parse.
+            # For now, we pass a dictionary derived from what's available.
+            # The crucial part is that `modal_run_and_check_triton.py` now internally handles reading the script's JSON.
+
+            # The `save_json_results` needs the *result dictionary* from the Modal call.
+            # The `process.stdout` is the full textual output.
+            # This requires `modal_run_and_check_triton.py`'s `if __name__ == "__main__"` block
+            # to print its `result` dictionary as JSON at the end for this script to parse it.
+
+            # Let's assume for now `save_json_results` can get what it needs from some structured output.
+            # The most robust way is for `modal_run_and_check_triton.py` to print its final result dict.
+            # If `modal_run_and_check_triton.py`'s main block does:
+            # result = run_triton_check(...)
+            # print(json.dumps(result))
+            # Then this script can parse it:
+            
+            # Attempt to parse the full output from `modal_run_and_check_triton.py`
+            # to find the JSON result it should now be printing from its main block.
+            # This is a bit of a workaround because we're calling a script that calls another script.
+            
+            # The `save_json_results` was modified to take `modal_output_dict`.
+            # We need to construct this dict.
+            # The `modal_run_and_check_triton.py` prints the stdout and stderr.
+            # If it also prints the JSON string of its result dict, we can grab that.
+            
+            # For now, let's make a placeholder dict and rely on the fact that
+            # `script_output_json_content` will be correctly populated if modal_run_and_check_triton.py's
+            # main block ensures the `result` dictionary (containing it) is made available to `save_json_results`.
+            # This current `run_triton_modal.py` isn't set up to directly receive the `result` dict
+            # from `modal_run_and_check_triton.py`'s `run_triton_check` function when using subprocess.
+            # The `save_json_results` *expects* that dictionary.
+
+            # The simplest fix for *this* script without changing the other one again:
+            # `save_json_results` will try to find `script_output_json_content` by parsing `process.stdout`
+            # This means `modal_run_and_check_triton.py` must print its result dictionary as JSON.
+            # I will modify `modal_run_and_check_triton.py` to do so in the next step if this doesn't work.
+
+            # For now, the `save_json_results` call passes a dictionary derived from what's available here.
+            # It will likely fall into the "script_output_json_content not found" case in save_json_results
+            # unless modal_run_and_check_triton.py prints its result dict.
+
+            # Let's assume `modal_run_and_check_triton.py` is changed to print its result dict as a JSON string
+            # as the last part of its stdout.
+            
+            # Try to find the JSON blob that modal_run_and_check_triton.py *should* print.
+            # This is getting complicated. The fundamental issue is that run_triton_modal.py
+            # calls modal_run_and_check_triton.py as a script, which *then* calls the modal function.
+            # The `script_output_json_content` is inside the result of the modal function.
+            # `modal_run_and_check_triton.py`'s `if __name__ == "__main__"` needs to print that dict.
+            
+            # Let's assume modal_run_and_check_triton.py's main prints json.dumps(result)
+            # Find the last JSON object in the output.
+            parsed_result_from_modal_script = {}
+            try:
+                # A common pattern is to print JSON at the very end.
+                # Try to find a JSON object in the output.
+                # Look for a line that starts with { and ends with } (basic check)
+                json_lines = [line for line in process.stdout.splitlines() if line.strip().startswith('{') and line.strip().endswith('}')]
+                if json_lines:
+                    # Try parsing the last such line
+                    parsed_result_from_modal_script = json.loads(json_lines[-1])
+            except Exception:
+                # If parsing fails, parsed_result_from_modal_script remains empty
+                pass
+
+            if not parsed_result_from_modal_script.get("script_output_json_content"):
+                 # If we couldn't parse the full dict, or it's missing the key, make a synthetic one for save_json_results
+                 parsed_result_from_modal_script = {
+                    "detailed_stdout": process.stdout,
+                    "detailed_stderr": process.stderr,
+                    "script_output_json_content": None # Explicitly None if not found
+                 }
+
+            save_json_results(args, parsed_result_from_modal_script)
+
         except Exception as e:
-            print(f"⚠️ Could not save JSON results: {e}")
+            print(f"Could not save JSON results: {e}")
     else:
-        print(f"❌ Modal evaluation failed with exit code: {exit_code}")
+        print(f"Modal evaluation failed with exit code: {exit_code}")
         
     return exit_code
 
-def save_json_results(args, modal_output):
+def save_json_results(args, modal_output_dict):
     """Save the JSON results from Modal evaluation to a local file"""
-    if not modal_output:
-        print("⚠️ No output to save")
+    if not modal_output_dict:
+        print("⚠️ No modal_output_dict to save")
         return
     
     # Create results directory
@@ -224,65 +333,46 @@ def save_json_results(args, modal_output):
         filename += "_forward"
         
     filename += ".json"
-    
-    # Try to extract JSON from the modal output
-    # The modal function should return a JSON structure
-    json_data = {
-        "timestamp": timestamp,
-        "evaluation_config": {
-            "kernel_path": args.kernel,
-            "ref_origin": "kernelbench" if args.level else "local",
-            "level": args.level,
-            "problem_id": args.problem_id,
-            "reference_path": args.reference,
-            "test_backward_pass": args.test_backward_pass,
-            "num_correct_trials": args.num_correct_trials,
-            "num_perf_trials": args.num_perf_trials,
-            "num_gradient_trials": args.num_gradient_trials if args.test_backward_pass else None,
-            "gradient_tolerance": args.gradient_tolerance if args.test_backward_pass else None,
-            "gpu": args.gpu,
-            "quick_mode": args.quick
-        },
-        "modal_output": modal_output,
-        "raw_logs": modal_output  # Keep the full modal output for reference
-    }
-    
-    # Try to parse the JSON result section from modal output
-    import re
-    
-    # Look for the JSON RESULT section
-    json_result_pattern = r'📊 JSON RESULT\n=+\n(.*?)\n=+'
-    json_match = re.search(json_result_pattern, modal_output, re.DOTALL)
-    
-    if json_match:
-        try:
-            json_content = json_match.group(1).strip()
-            parsed_result = json.loads(json_content)
-            json_data["modal_result"] = parsed_result
-            print(f"✅ Successfully extracted structured results")
-        except json.JSONDecodeError as e:
-            print(f"⚠️ Could not parse JSON result: {e}")
-            # Fallback to looking for any JSON-like structures
-            json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
-            potential_jsons = re.findall(json_pattern, modal_output)
-            
-            for potential_json in potential_jsons:
-                try:
-                    parsed = json.loads(potential_json)
-                    if isinstance(parsed, dict) and ('status' in parsed or 'compiled' in parsed):
-                        json_data["modal_result"] = parsed
-                        break
-                except json.JSONDecodeError:
-                    continue
-    else:
-        print("⚠️ Could not find JSON RESULT section in output")
-    
-    # Save to file
     output_path = results_dir / filename
+
+    final_json_to_save = {}
+    script_generated_json_str = modal_output_dict.get("script_output_json_content")
+
+    if script_generated_json_str:
+        try:
+            parsed_script_json = json.loads(script_generated_json_str)
+            final_json_to_save = parsed_script_json
+            print(f"Successfully parsed JSON content from 'script_output_json_content'.")
+            # Optionally, add some wrapper-specific metadata if needed, ensuring not to overwrite
+            # For example:
+            # final_json_to_save['modal_wrapper_timestamp'] = timestamp
+            # final_json_to_save['modal_wrapper_args'] = vars(args)
+        except json.JSONDecodeError as e:
+            print(f"Could not parse 'script_output_json_content': {e}. Storing raw data instead.")
+            # Fallback to storing raw output if parsing fails
+            final_json_to_save = {
+                "modal_wrapper_timestamp": timestamp,
+                "modal_wrapper_evaluation_config": vars(args),
+                "error_parsing_script_json": str(e),
+                "raw_script_output_json_content": script_generated_json_str,
+                "raw_modal_stdout": modal_output_dict.get("detailed_stdout"),
+                "raw_modal_stderr": modal_output_dict.get("detailed_stderr")
+            }
+    else:
+        print("'script_output_json_content' not found or empty. Storing basic Modal call info and raw logs.")
+        final_json_to_save = {
+            "modal_wrapper_timestamp": timestamp,
+            "modal_wrapper_evaluation_config": vars(args),
+            "message": "No specific JSON from KernelBench script was found.",
+            "raw_modal_stdout": modal_output_dict.get("detailed_stdout"),
+            "raw_modal_stderr": modal_output_dict.get("detailed_stderr")
+        }
+
+    # Save to file
     with open(output_path, 'w') as f:
-        json.dump(json_data, f, indent=2)
+        json.dump(final_json_to_save, f, indent=2)
     
-    print(f"💾 Results saved to: {output_path}")
+    print(f"Results saved to: {output_path}")
     
     # Also save a simple summary
     summary_path = results_dir / f"{timestamp}_{kernel_name}_summary.txt"

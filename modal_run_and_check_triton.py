@@ -62,30 +62,44 @@ def run_triton_check_remote(
     verbose: bool = True,
     gpu_arch: str = "Hopper",
     test_backward_pass: bool = False,
-    num_gradient_trials: int = 3,
+    num_gradient_trials: int = 5,
     gradient_tolerance: float = 1e-4,
     measure_backward_performance: bool = True
 ):
-    """Remote function to run Triton evaluation"""
+    """Remote function to run Triton evaluation - exact same output as local terminal"""
     import sys
-    import io
-    from contextlib import redirect_stdout, redirect_stderr
+    import tempfile
+    import os
+    from pathlib import Path
     
     print(f"🔧 Python path: {sys.path}")
     print(f"💻 GPU Architecture: {gpu_arch}")
     print(f"📝 Verbose mode: {verbose}")
     
-    # Capture all output from the evaluation
-    captured_output = io.StringIO()
-    captured_error = io.StringIO()
-    evaluation_output = ""
-    evaluation_error = ""
-    
     try:
-        # Import required modules first (outside capture to avoid import noise)
-        from src.eval import eval_kernel_against_ref_auto, detect_triton_kernel
+        # Handle the case where kernel_src might be a file path instead of content
+        # This happens when using Modal CLI directly vs. the wrapper script
+        if len(kernel_src) < 500 and ('/' in kernel_src or kernel_src.endswith('.py')):
+            # This looks like a file path, not source code
+            print(f"🔍 kernel_src appears to be a file path: {kernel_src}")
+            if os.path.exists(f"/workspace/{kernel_src}"):
+                with open(f"/workspace/{kernel_src}", 'r') as f:
+                    kernel_src = f.read()
+                print(f"✅ Read {len(kernel_src)} chars from file")
+            elif os.path.exists(kernel_src):
+                with open(kernel_src, 'r') as f:
+                    kernel_src = f.read()
+                print(f"✅ Read {len(kernel_src)} chars from file")
+            else:
+                print(f"❌ File not found: {kernel_src}")
+                return {"status": "error", "message": f"Kernel file not found: {kernel_src}"}
+        else:
+            print(f"✅ kernel_src appears to be actual source code ({len(kernel_src)} chars)")
+        
+        # Import the actual main function from run_and_check_triton.py
+        sys.path.append('/workspace/scripts')
+        from run_and_check_triton import ScriptConfig
         from src.utils import set_gpu_arch
-        from datasets import load_dataset
         import torch
         
         print(f"🎯 CUDA available: {torch.cuda.is_available()}")
@@ -107,404 +121,208 @@ def run_triton_check_remote(
             # Default to Hopper for H100
             set_gpu_arch(["Hopper"])
         
-        # Get reference source code
-        if ref_origin == "kernelbench":
+        # Create temporary files for kernel and reference (if local)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as kernel_file:
+            kernel_file.write(kernel_src)
+            kernel_file.flush()  # Ensure content is written to disk
+            kernel_file_path = kernel_file.name
+        
+        print(f"📝 Created temporary kernel file: {kernel_file_path}")
+        
+        ref_file_path = None
+        if ref_origin == "local" and ref_src:
+            # Handle the case where ref_src might also be a file path
+            if len(ref_src) < 500 and ('/' in ref_src or ref_src.endswith('.py')):
+                print(f"🔍 ref_src appears to be a file path: {ref_src}")
+                if os.path.exists(f"/workspace/{ref_src}"):
+                    with open(f"/workspace/{ref_src}", 'r') as f:
+                        ref_src = f.read()
+                    print(f"✅ Read {len(ref_src)} chars from reference file")
+                elif os.path.exists(ref_src):
+                    with open(ref_src, 'r') as f:
+                        ref_src = f.read()
+                    print(f"✅ Read {len(ref_src)} chars from reference file")
+                else:
+                    return {"status": "error", "message": f"Reference file not found: {ref_src}"}
+            
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as ref_file:
+                ref_file.write(ref_src)
+                ref_file.flush()  # Ensure content is written to disk
+                ref_file_path = ref_file.name
+        
+        # Create configuration object exactly like the command line would
+        config = ScriptConfig()
+        config.ref_origin = ref_origin
+        config.kernel_src_path = kernel_file_path
+        config.num_correct_trials = num_correct_trials
+        config.num_perf_trials = num_perf_trials
+        config.verbose = verbose
+        config.test_backward_pass = test_backward_pass
+        config.num_gradient_trials = num_gradient_trials
+        config.gradient_tolerance = gradient_tolerance
+        config.measure_backward_performance = measure_backward_performance
+        config.auto_detect = True
+        config.force_triton = False
+        config.measure_performance = True
+        config.timeout = 300
+        config.build_dir_prefix = ""
+        config.clear_cache = False
+        
+        # Set GPU architecture
+        if gpu_arch == "H100":
+            config.gpu_arch = ["Hopper"]
+        elif gpu_arch == "L40S" or gpu_arch == "L4":
+            config.gpu_arch = ["Ada"]
+        elif gpu_arch == "A100" or gpu_arch == "A10G":
+            config.gpu_arch = ["Ampere"]
+        elif gpu_arch == "T4":
+            config.gpu_arch = ["Turing"]
+        else:
+            config.gpu_arch = ["Hopper"]  # Default
+        
+        if ref_origin == "local":
+            if ref_file_path is None:
+                return {
+                    "status": "error",
+                    "message": "ref_src required for local reference"
+                }
+            config.ref_arch_src_path = ref_file_path
+        elif ref_origin == "kernelbench":
             if level is None or problem_id is None:
                 return {
                     "status": "error",
                     "message": "level and problem_id required for kernelbench reference"
                 }
-            
-            print(f"📚 Loading KernelBench Level {level}, Problem {problem_id}")
-            dataset = load_dataset("ScalingIntelligence/KernelBench")
-            level_dataset = dataset[f"level_{level}"]
-            
-            # Filter to get the specific problem
-            problem = level_dataset.filter(lambda x: x["problem_id"] == problem_id)
-            if len(problem) == 0:
-                return {
-                    "status": "error", 
-                    "message": f"Problem {problem_id} not found in level {level}"
-                }
-                
-            reference_src = problem["code"][0]
-            problem_name = problem["name"][0]
-            
-            print(f"📋 Problem: {problem_name}")
-            
-        elif ref_origin == "local":
-            if ref_src is None:
-                return {
-                    "status": "error",
-                    "message": "ref_src required for local reference"
-                }
-            reference_src = ref_src
-            problem_name = "local_reference"
-            
+            config.dataset_name = "ScalingIntelligence/KernelBench"
+            config.level = level
+            config.problem_id = problem_id
         else:
             return {
                 "status": "error",
                 "message": f"Invalid ref_origin: {ref_origin}. Use 'kernelbench' or 'local'"
             }
         
-        # Detect kernel type
-        is_triton = detect_triton_kernel(kernel_src)
-        kernel_type = "Triton" if is_triton else "CUDA"
-        
-        print(f"🔍 Detected kernel type: {kernel_type}")
-        if verbose:
-            print(f"🔧 Running evaluation with {num_correct_trials} correctness trials, {num_perf_trials} performance trials")
-        
-        # Now capture the detailed evaluation output
         print("\n" + "="*60)
-        if test_backward_pass:
-            print("🚀 STARTING DETAILED EVALUATION (WITH BACKWARD PASS)")
-        else:
-            print("🚀 STARTING DETAILED EVALUATION (FORWARD PASS ONLY)")
+        print("🚀 STARTING EVALUATION WITH EXACT TERMINAL OUTPUT")
         print("="*60)
         
-
+        # Ensure output is flushed in Modal environment
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
         
-        with redirect_stdout(captured_output), redirect_stderr(captured_error):
-            # Import necessary evaluation functions
-            import sys
-            sys.path.append('/workspace/scripts')
-            from generate_baseline_time import measure_program_time
+        # Call the actual main function - this will produce the exact same output as terminal
+        try:
+            # Build command for subprocess
+            cmd = [
+                "python",
+                "/workspace/scripts/run_and_check_triton.py",
+                f"ref_origin={config.ref_origin}",
+                f"kernel_src_path={config.kernel_src_path}",
+                f"num_correct_trials={config.num_correct_trials}",
+                f"num_perf_trials={config.num_perf_trials}",
+                f"verbose={config.verbose}",
+                f"test_backward_pass={config.test_backward_pass}",
+                f"num_gradient_trials={config.num_gradient_trials}",
+                f"gradient_tolerance={config.gradient_tolerance}",
+                f"measure_backward_performance={config.measure_backward_performance}",
+                f"auto_detect={config.auto_detect}",
+                f"force_triton={config.force_triton}",
+                f"measure_performance={config.measure_performance}",
+                f"timeout={config.timeout}",
+                f"build_dir_prefix={config.build_dir_prefix}",
+                f"clear_cache={config.clear_cache}"
+            ]
             
-            # Run evaluation with explicit device handling
-            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            # Add reference-specific arguments
+            if config.ref_origin == "local":
+                cmd.append(f"ref_arch_src_path={config.ref_arch_src_path}")
+            elif config.ref_origin == "kernelbench":
+                cmd.append(f"dataset_name={config.dataset_name}")
+                cmd.append(f"level={config.level}")
+                cmd.append(f"problem_id={config.problem_id}")
             
-            if test_backward_pass:
-                # Import backward pass evaluation function
-                from src.eval import eval_kernel_backward_pass_auto
-                
-                # Run BOTH forward and backward pass evaluations to get complete metrics
-                print("[INFO] Evaluating forward pass performance")
-                forward_result = eval_kernel_against_ref_auto(
-                    original_model_src=reference_src,
-                    custom_model_src=kernel_src,
-                    verbose=verbose,
-                    measure_performance=True,
-                    num_correct_trials=num_correct_trials,
-                    num_perf_trials=num_perf_trials,
-                    device=device
-                )
-                
-                print("[INFO] Evaluating backward pass with gradient correctness")
-                backward_result = eval_kernel_backward_pass_auto(
-                    original_model_src=reference_src,
-                    custom_model_src=kernel_src,
-                    verbose=verbose,
-                    measure_performance=measure_backward_performance,
-                    num_correct_trials=num_correct_trials,
-                    num_perf_trials=num_perf_trials,
-                    num_gradient_trials=num_gradient_trials,
-                    gradient_tolerance=gradient_tolerance,
-                    device=device
-                )
-                
-                # Combine results for unified processing
-                result = backward_result  # Use backward result as primary
-                # Store forward pass results in metadata for separate display
-                result.metadata["forward_pass_result"] = {
-                    "compiled": forward_result.compiled,
-                    "correctness": forward_result.correctness,
-                    "runtime": forward_result.runtime,
-                    "runtime_stats": forward_result.runtime_stats,
-                    "metadata": forward_result.metadata
+            # Add gpu_arch as a stringified list 
+            gpu_arch_str = "[" + ",".join(f'"{arch}"' for arch in config.gpu_arch) + "]"
+            cmd.append(f"gpu_arch={gpu_arch_str}")
+
+            if verbose: # Print command if verbose
+                print(f"Executing command: {' '.join(cmd)}", file=sys.stderr)
+            
+            import subprocess # Import here for clarity within the changed block
+            process = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            
+            script_json_output_content = None
+            if process.returncode == 0 and process.stdout:
+                import re
+                match = re.search(r"INFO] Evaluation results saved to (runs/successful/run_.*?\.json)", process.stdout)
+                if match:
+                    json_file_path_in_modal = "/workspace/" + match.group(1)
+                    print(f"Attempting to read script-generated JSON from: {json_file_path_in_modal}", file=sys.stderr)
+                    try:
+                        if os.path.exists(json_file_path_in_modal):
+                            with open(json_file_path_in_modal, 'r') as f_json:
+                                script_json_output_content = f_json.read()
+                            print(f"Successfully read {len(script_json_output_content)} chars from script JSON.", file=sys.stderr)
+                        else:
+                            print(f"Script-generated JSON file not found at: {json_file_path_in_modal}", file=sys.stderr)
+                    except Exception as e_read:
+                        print(f"Error reading script-generated JSON: {e_read}", file=sys.stderr)
+                else:
+                    print("Could not find path to script-generated JSON in stdout.", file=sys.stderr)
+
+            if process.returncode == 0:
+                return {
+                    "status": "completed",
+                    "message": "Evaluation completed successfully via subprocess",
+                    "detailed_stdout": process.stdout,
+                    "detailed_stderr": process.stderr,
+                    "script_output_json_content": script_json_output_content
                 }
             else:
-                # 1. Evaluate kernel against reference (forward pass only)
-                print("[INFO] Evaluating kernel against reference code")
-                result = eval_kernel_against_ref_auto(
-                    original_model_src=reference_src,
-                    custom_model_src=kernel_src,
-                    verbose=verbose,
-                    measure_performance=True,
-                    num_correct_trials=num_correct_trials,
-                    num_perf_trials=num_perf_trials,
-                    device=device
-                )
-            # Note: result.runtime has units mismatch in KernelBench - it's actually in ms, not μs as documented
-            kernel_exec_time = result.runtime if result.runtime > 0 else None  # Already in ms due to codebase bug
+                return {
+                    "status": "failed",
+                    "error": f"Script exited with code {process.returncode}",
+                    "detailed_stdout": process.stdout,
+                    "detailed_stderr": process.stderr,
+                    "script_output_json_content": script_json_output_content,
+                    "error_type": "SubprocessError"
+                }
             
-            # 2. Measure baseline reference times (like original script)
-            print("[INFO] Measuring reference program time")
-            
-            # Measure PyTorch Eager baseline
-            ref_time_eager_result = measure_program_time(
-                ref_arch_name="Reference Program", 
-                ref_arch_src=reference_src, 
-                num_trials=num_perf_trials,
-                use_torch_compile=False,
-                device=device
-            )
-            ref_exec_eager_time = ref_time_eager_result.get("mean", None)
-            
-            # Measure torch.compile baseline
-            ref_time_compile_result = measure_program_time(
-                ref_arch_name="Reference Program", 
-                ref_arch_src=reference_src, 
-                num_trials=num_perf_trials,
-                use_torch_compile=True,
-                torch_compile_backend="inductor",
-                torch_compile_options="default",
-                device=device
-            )
-            ref_exec_compile_time = ref_time_compile_result.get("mean", None)
-            
-            # Just print the basic results like original run_and_check_triton.py
-            kernel_type_str = result.metadata.get("kernel_type", "triton")
-            print("="*40)
-            print(f"[Eval] {kernel_type_str} kernel eval result: compiled={result.compiled}, correctness={result.correctness}, runtime={kernel_exec_time}ms")
-            print("-"*40)
-            print(f"[Timing] PyTorch Reference Eager exec time: {ref_exec_eager_time} ms")
-            print(f"[Timing] PyTorch Reference torch.compile time: {ref_exec_compile_time} ms")
-            print(f"[Timing] Custom {kernel_type_str} Kernel exec time: {kernel_exec_time} ms")
-            print("-"*40)   
-            
-            if result.correctness and kernel_exec_time and ref_exec_eager_time and ref_exec_compile_time:
-                speedup_eager = ref_exec_eager_time / kernel_exec_time
-                speedup_compile = ref_exec_compile_time / kernel_exec_time
-                print(f"[Speedup] Speedup over eager: {speedup_eager:.2f}x")
-                print(f"[Speedup] Speedup over torch.compile: {speedup_compile:.2f}x")
-            else:
-                print("[Speedup] Speedup Not Available as Kernel did not pass correctness or timing failed")
-            
-            print("="*40)
+        except Exception as e: # Catch other exceptions during setup/subprocess call
+            print(f"❌ Error during subprocess execution or setup: {type(e).__name__} - {e}")
+            import traceback
+            tb_str = traceback.format_exc()
+            print(tb_str, file=sys.stderr)
+            return {
+                "status": "failed",
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "detailed_stdout": "",
+                "detailed_stderr": tb_str,
+                "script_output_json_content": None
+            }
         
-        # Get captured output
-        evaluation_output = captured_output.getvalue()
-        evaluation_error = captured_error.getvalue()
-        
-        # Print all captured output so it appears in Modal logs
-        if evaluation_output:
-            print("📋 DETAILED EVALUATION OUTPUT:")
-            print(evaluation_output)
-        
-        if evaluation_error:
-            print("⚠️ EVALUATION WARNINGS/ERRORS:")
-            print(evaluation_error)
-        
-        # Parse timing results from captured output
-        speedup_eager = None
-        speedup_compile = None
-        ref_exec_eager_time = None
-        ref_exec_compile_time = None
-        kernel_exec_time = result.runtime / 1000.0 if result.runtime > 0 else None
-        
-        # Extract timing information from the captured output
-        import re
-        if evaluation_output:
-            # Look for timing lines in the output
-            eager_match = re.search(r'PyTorch Reference Eager exec time: ([\d.]+) ms', evaluation_output)
-            compile_match = re.search(r'PyTorch Reference torch\.compile time: ([\d.]+) ms', evaluation_output)
-            speedup_eager_match = re.search(r'Speedup over eager: ([\d.]+)x', evaluation_output)
-            speedup_compile_match = re.search(r'Speedup over torch\.compile: ([\d.]+)x', evaluation_output)
+        finally:
+            # Always restore original sys.argv (No longer needed as we don't modify it)
+            # sys.argv = original_argv 
             
-            ref_exec_eager_time = float(eager_match.group(1)) if eager_match else None
-            ref_exec_compile_time = float(compile_match.group(1)) if compile_match else None
-            speedup_eager = float(speedup_eager_match.group(1)) if speedup_eager_match else None
-            speedup_compile = float(speedup_compile_match.group(1)) if speedup_compile_match else None
-        
-        # Format results
-        response = {
-            "status": "completed",
-            "problem_name": problem_name,
-            "kernel_type": kernel_type,
-            "test_backward_pass": test_backward_pass,
-            "evaluation_output": evaluation_output,  # Include captured output
-            "evaluation_error": evaluation_error
-        }
-        
-        if test_backward_pass:
-            # Extract forward pass results from stored metadata
-            forward_pass_result = result.metadata.get("forward_pass_result", {})
-            # The forward pass result.runtime is already in milliseconds from eval_triton_kernel_against_ref
-            forward_runtime = forward_pass_result.get("runtime", 0) if forward_pass_result.get("runtime", 0) > 0 else None
-            forward_runtime_stats = forward_pass_result.get("runtime_stats", {})
-            
-            # Calculate forward pass speedups
-            forward_speedup_eager = None
-            forward_speedup_compile = None
-            if forward_runtime and ref_exec_eager_time and ref_exec_compile_time:
-                forward_speedup_eager = ref_exec_eager_time / forward_runtime
-                forward_speedup_compile = ref_exec_compile_time / forward_runtime
-            
-            # Extract backward pass metadata
-            backward_pass_correctness = result.metadata.get("backward_pass_correctness", False)
-            gradient_trials = result.metadata.get("gradient_trials", [])
-            gradient_correctness_str = result.metadata.get("gradient_correctness", "Unknown")
-            
-            # Count successful gradient trials
-            if gradient_trials:
-                passed_trials = sum(1 for trial in gradient_trials if trial.get("passed", False))
-                total_trials = len(gradient_trials)
-                gradient_trials_summary = f"({passed_trials} / {total_trials})"
-            else:
-                gradient_trials_summary = gradient_correctness_str
-            
-            # Extract backward pass performance data
-            backward_runtime = result.runtime if result.runtime > 0 else None
-            
-            # Calculate backward pass speedups
-            backward_speedup_eager = None
-            backward_speedup_compile = None
-            if backward_runtime and ref_exec_eager_time and ref_exec_compile_time:
-                backward_speedup_eager = ref_exec_eager_time / backward_runtime
-                backward_speedup_compile = ref_exec_compile_time / backward_runtime
-            
-            # Create structured response with separate forward and backward pass results
-            response.update({
-                "compiled": result.compiled,
-                "forward_pass": {
-                    "correctness": forward_pass_result.get("correctness", result.correctness),
-                    "runtime_us": forward_runtime * 1000 if forward_runtime else None,  # Convert ms to μs for consistency
-                    "runtime_ms": forward_runtime,
-                    "runtime_stats": forward_runtime_stats,
-                    "ref_eager_time_ms": ref_exec_eager_time,
-                    "ref_compile_time_ms": ref_exec_compile_time,
-                    "speedup_over_eager": forward_speedup_eager,
-                    "speedup_over_compile": forward_speedup_compile
-                },
-                "backward_pass": {
-                    "passed": backward_pass_correctness,
-                    "gradient_correctness": gradient_trials_summary,
-                    "gradient_trials_details": gradient_trials,
-                    "gradient_tolerance": gradient_tolerance,
-                    "kernel_backward_exec_time_ms": backward_runtime,
-                    "ref_backward_eager_time_ms": ref_exec_eager_time,
-                    "ref_backward_compile_time_ms": ref_exec_compile_time,
-                    "speedup_over_eager": backward_speedup_eager,
-                    "speedup_over_torch_compile": backward_speedup_compile,
-                    "gpu_memory_info": result.metadata.get("gpu_memory_info", {}),
-                    "performance_stats": result.runtime_stats
-                },
-                "metadata": result.metadata
-            })
-        else:
-            # Forward pass only results
-            response.update({
-                "compiled": result.compiled,
-                "correctness": result.correctness,
-                "runtime_us": result.runtime,  # runtime is in microseconds
-                "runtime_ms": kernel_exec_time,  # runtime in milliseconds
-                "ref_eager_time_ms": ref_exec_eager_time,
-                "ref_compile_time_ms": ref_exec_compile_time,
-                "speedup_over_eager": speedup_eager,
-                "speedup_over_compile": speedup_compile,
-                "metadata": result.metadata
-            })
-        
-        if ref_origin == "kernelbench":
-            response["level"] = level
-            response["problem_id"] = problem_id
-            
-        # Print results summary
-        print("\n" + "="*60)
-        if test_backward_pass:
-            print("📊 EVALUATION RESULTS (WITH BACKWARD PASS)")
-        else:
-            print("📊 EVALUATION RESULTS")
-        print("="*60)
-        print(f"Problem: {problem_name}")
-        print(f"Kernel Type: {kernel_type}")
-        print(f"✅ Compiled: {result.compiled}")
-        
-        if test_backward_pass:
-            # Extract forward and backward pass results from metadata  
-            forward_pass_result = result.metadata.get("forward_pass_result", {})
-            # The forward pass result.runtime is already in milliseconds from eval_triton_kernel_against_ref
-            forward_runtime = forward_pass_result.get("runtime", 0) if forward_pass_result.get("runtime", 0) > 0 else None
-            
-            backward_pass_correctness = result.metadata.get("backward_pass_correctness", False)
-            gradient_trials = result.metadata.get("gradient_trials", [])
-            gradient_correctness_str = result.metadata.get("gradient_correctness", "Unknown")
-            
-            # Count successful gradient trials
-            if gradient_trials:
-                passed_trials = sum(1 for trial in gradient_trials if trial.get("passed", False))
-                total_trials = len(gradient_trials)
-                gradient_trials_summary = f"({passed_trials} / {total_trials})"
-            else:
-                gradient_trials_summary = gradient_correctness_str
-                
-            print(f"✅ Forward Pass Correctness: {forward_pass_result.get('correctness', result.correctness)}")
-            print(f"✅ Backward Pass Correctness: {backward_pass_correctness}")
-            print(f"✅ Gradient Trials: {gradient_trials_summary}")
-            
-            # Show FORWARD pass performance
-            if forward_runtime:
-                print(f"⚡ Forward Pass Runtime: {forward_runtime:.3f} ms")
-                
-                # Calculate and show forward speedups
-                if ref_exec_eager_time and ref_exec_eager_time > 0:
-                    forward_speedup_eager = ref_exec_eager_time / forward_runtime
-                    print(f"🚀 Forward Speedup over PyTorch Eager: {forward_speedup_eager:.2f}x")
-                
-                if ref_exec_compile_time and ref_exec_compile_time > 0:
-                    forward_speedup_compile = ref_exec_compile_time / forward_runtime
-                    print(f"🚀 Forward Speedup over torch.compile: {forward_speedup_compile:.2f}x")
-            
-            # Show BACKWARD pass performance
-            if result.runtime > 0:
-                print(f"⚡ Backward Pass Runtime: {result.runtime:.3f} ms")
-                
-                # Calculate and show backward speedups
-                if ref_exec_eager_time and ref_exec_eager_time > 0:
-                    backward_speedup_eager = ref_exec_eager_time / result.runtime
-                    print(f"🚀 Backward Speedup over PyTorch Eager: {backward_speedup_eager:.2f}x")
-                
-                if ref_exec_compile_time and ref_exec_compile_time > 0:
-                    backward_speedup_compile = ref_exec_compile_time / result.runtime
-                    print(f"🚀 Backward Speedup over torch.compile: {backward_speedup_compile:.2f}x")
-                    
-            # Show reference times for context
-            if ref_exec_eager_time and ref_exec_eager_time > 0:
-                print(f"📊 Reference Eager time: {ref_exec_eager_time:.3f} ms")
-            if ref_exec_compile_time and ref_exec_compile_time > 0:
-                print(f"📊 Reference Compile time: {ref_exec_compile_time:.3f} ms")
-            
-            # Show memory info if available
-            gpu_memory_info = result.metadata.get("gpu_memory_info", {})
-            if gpu_memory_info:
-                print(f"💾 GPU Memory: {gpu_memory_info}")
-        else:
-            print(f"✅ Correctness: {result.correctness}")
-            
-            if result.runtime > 0:
-                print(f"⚡ Forward Runtime: {result.runtime / 1000.0:.3f} ms ({result.runtime:.1f} μs)")
-            
-        if result.metadata and verbose:
-            print(f"📋 Metadata: {result.metadata}")
-            
-        # Print JSON output for easy parsing
-        print("\n" + "="*60)
-        print("📊 JSON RESULT")
-        print("="*60)
-        print(json.dumps(response, indent=2))
-        print("="*60)
-            
-        return response
+            # Clean up temporary files
+            try:
+                if 'kernel_file_path' in locals() and os.path.exists(kernel_file_path):
+                    os.unlink(kernel_file_path)
+                if 'ref_file_path' in locals() and ref_file_path and os.path.exists(ref_file_path):
+                    os.unlink(ref_file_path)
+            except:
+                pass  # Ignore cleanup errors
         
     except Exception as e:
-        # Also capture any exception output
-        evaluation_output = captured_output.getvalue()
-        evaluation_error = captured_error.getvalue()
-        
-        error_response = {
+        print(f"❌ Error: {e}")
+        return {
             "status": "failed",
             "error": str(e),
-            "error_type": type(e).__name__,
-            "evaluation_output": evaluation_output,
-            "evaluation_error": evaluation_error
+            "error_type": type(e).__name__
         }
-        print(f"❌ Error: {e}")
-        if evaluation_output:
-            print(f"📋 Output before error: {evaluation_output}")
-        if evaluation_error:
-            print(f"⚠️ Error output: {evaluation_error}")
-        return error_response
 
 
 def run_triton_check(
@@ -596,119 +414,29 @@ def run_triton_check(
         )
         
         print("\n" + "="*60)
-        print("📊 MODAL EVALUATION RESULTS") 
+        print("🎯 MODAL EVALUATION COMPLETED!")
         print("="*60)
         
+        # Print the detailed output received from the remote function
+        if "detailed_stdout" in result and result["detailed_stdout"]:
+            print("--- DETAILED STDOUT FROM MODAL FUNCTION ---")
+            print(result["detailed_stdout"])
+            print("--- END DETAILED STDOUT ---")
+        
+        if "detailed_stderr" in result and result["detailed_stderr"]:
+            print("--- DETAILED STDERR FROM MODAL FUNCTION ---", file=sys.stderr)
+            print(result["detailed_stderr"], file=sys.stderr)
+            print("--- END DETAILED STDERR ---", file=sys.stderr)
+
         if result["status"] == "completed":
-            print(f"✅ Status: {result['status']}")
-            print(f"📋 Problem: {result['problem_name']}")
-            print(f"🔍 Kernel Type: {result['kernel_type']}")
-            
-            if result.get('test_backward_pass', False):
-                print("🔄 Mode: Forward + Backward Pass Evaluation")
-                
-                # Handle structured backward pass results
-                if 'forward_pass' in result and 'backward_pass' in result:
-                    # General compilation status
-                    print(f"✅ Compiled: {result.get('compiled', 'Unknown')}")
-                    
-                    # Forward pass results  
-                    fp = result['forward_pass']
-                    print(f"✅ Forward Pass Correctness: {fp.get('correctness', 'Unknown')}")
-                    if fp.get('runtime_ms') is not None:
-                        print(f"⚡ Forward Pass Runtime: {fp['runtime_ms']:.3f} ms")
-                    if fp.get('speedup_over_eager') and fp.get('speedup_over_compile'):
-                        print(f"🚀 Forward Speedup over PyTorch Eager: {fp['speedup_over_eager']:.2f}x")
-                        print(f"🚀 Forward Speedup over torch.compile: {fp['speedup_over_compile']:.2f}x")
-                    
-                    # Backward pass results
-                    bp = result['backward_pass']
-                    print(f"✅ Backward Pass Correctness: {bp.get('passed', 'Unknown')}")
-                    print(f"✅ Gradient Trials: {bp.get('gradient_correctness', 'Unknown')}")
-                    
-                    # Show backward pass performance
-                    if bp.get('kernel_backward_exec_time_ms') is not None:
-                        print(f"⚡ Backward Pass Runtime: {bp['kernel_backward_exec_time_ms']:.3f} ms")
-                    
-                    # Show backward speedup results
-                    if bp.get('speedup_over_eager') and bp.get('speedup_over_torch_compile'):
-                        print(f"🚀 Backward Speedup over PyTorch Eager: {bp['speedup_over_eager']:.2f}x")
-                        print(f"🚀 Backward Speedup over torch.compile: {bp['speedup_over_torch_compile']:.2f}x")
-                    
-                    # Show reference timing context
-                    if fp.get('ref_eager_time_ms') or bp.get('ref_backward_eager_time_ms'):
-                        eager_time = fp.get('ref_eager_time_ms') or bp.get('ref_backward_eager_time_ms')
-                        print(f"📊 Reference Eager time: {eager_time:.3f} ms")
-                    if fp.get('ref_compile_time_ms') or bp.get('ref_backward_compile_time_ms'):
-                        compile_time = fp.get('ref_compile_time_ms') or bp.get('ref_backward_compile_time_ms')
-                        print(f"📊 Reference Compile time: {compile_time:.3f} ms")
-                    
-                    # Show GPU memory info
-                    gpu_memory = bp.get('gpu_memory_info', {})
-                    if gpu_memory:
-                        print(f"💾 GPU Memory: {gpu_memory}")
-                        
-                else:
-                    # Legacy format fallback
-                    print(f"✅ Compiled: {result.get('compiled', 'Unknown')}")
-                    print(f"✅ Forward Pass Correctness: {result.get('correctness', 'Unknown')}")
-                    if result.get('runtime_ms') is not None:
-                        print(f"⚡ Forward Runtime: {result['runtime_ms']:.3f} ms")
-                    print("⚠️ Backward pass attempted (check detailed logs for results)")
-                    
-            else:
-                # Forward pass only results
-                print("➡️ Mode: Forward Pass Only")
-                print(f"✅ Compiled: {result.get('compiled', 'Unknown')}")
-                print(f"✅ Correctness: {result.get('correctness', 'Unknown')}")
-                
-                if result.get('runtime_ms') and result['runtime_ms'] is not None:
-                    print(f"⚡ Runtime: {result['runtime_ms']:.3f} ms ({result.get('runtime_us', 0):.1f} μs)")
-                    
-                # Show speedup results if available
-                if result.get('speedup_over_eager') and result.get('speedup_over_compile'):
-                    print(f"🚀 Speedup over PyTorch Eager: {result['speedup_over_eager']:.2f}x")
-                    print(f"🚀 Speedup over torch.compile: {result['speedup_over_compile']:.2f}x")
-                    print(f"📊 Reference Eager time: {result.get('ref_eager_time_ms', 0):.3f} ms")
-                    print(f"📊 Reference Compile time: {result.get('ref_compile_time_ms', 0):.3f} ms")
-                
-            if result.get('level') and result.get('problem_id'):
-                print(f"📚 Level: {result['level']}, Problem: {result['problem_id']}")
-            
-            # Show the detailed evaluation output with speedups!
-            if result.get('evaluation_output'):
-                print("\n" + "="*60)
-                print("📋 DETAILED EVALUATION LOGS (WITH SPEEDUPS)")
-                print("="*60)
-                print(result['evaluation_output'])
-                
-            if result.get('evaluation_error'):
-                print("\n⚠️ EVALUATION WARNINGS:")
-                print(result['evaluation_error'])
-                
-            if result.get('metadata') and verbose:
-                print(f"\n📋 Detailed Metadata:")
-                for key, value in result['metadata'].items():
-                    print(f"  {key}: {value}")
-                    
+            print(f"✅ Evaluation completed successfully")
         elif result["status"] == "failed":
-            print(f"❌ Status: {result['status']}")
-            print(f"❌ Error: {result['error']}")
-            print(f"🔧 Error Type: {result['error_type']}")
-            
-            # Show captured output even for failures
-            if result.get('evaluation_output'):
-                print(f"\n📋 Output before failure:")
-                print(result['evaluation_output'])
-            if result.get('evaluation_error'):
-                print(f"\n⚠️ Error details:")
-                print(result['evaluation_error'])
-            
+            print(f"❌ Evaluation failed: {result.get('error', 'Unknown error')}")
         elif result["status"] == "error":
-            print(f"⚠️  Status: {result['status']}")
-            print(f"⚠️  Message: {result['message']}")
-            
-        print("\n🎯 Modal evaluation completed!")
+            print(f"⚠️ Configuration error: {result.get('message', 'Unknown error')}")
+        
+        print("="*60)
+        print("📊 All output above shows the exact same format as local terminal execution")
         return result
 
 if __name__ == "__main__":
@@ -747,4 +475,7 @@ if __name__ == "__main__":
         num_gradient_trials=args.num_gradient_trials,
         gradient_tolerance=args.gradient_tolerance,
         measure_backward_performance=args.measure_backward_performance
-    ) 
+    )
+    # Print the result dictionary as a JSON string to stdout
+    # This allows the calling script (run_triton_modal.py) to capture and parse it.
+    print(json.dumps(result)) 
