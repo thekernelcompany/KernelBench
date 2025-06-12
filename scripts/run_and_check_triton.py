@@ -5,6 +5,10 @@ from pydra import REQUIRED, Config
 import os
 from datasets import load_dataset
 
+# New imports
+import json
+import datetime
+import re
 
 import sys
 import os
@@ -262,6 +266,126 @@ def main(config: ScriptConfig):
 
     print("="*40)
 
+    # --- BEGIN NEW JSON LOGGING CODE ---
+    output_base_dir = "runs"
+    successful_dir = os.path.join(output_base_dir, "successful")
+    failed_dir = os.path.join(output_base_dir, "failed")
+
+    os.makedirs(successful_dir, exist_ok=True)
+    os.makedirs(failed_dir, exist_ok=True)
+
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    
+    ref_name_for_filename = "unknown_ref"
+    if config.ref_origin == "local":
+        if config.ref_arch_src_path:
+            ref_name_for_filename = os.path.splitext(os.path.basename(config.ref_arch_src_path))[0]
+    elif config.ref_origin == "kernelbench":
+        # problem_name is defined earlier in the main function if ref_origin is kernelbench
+        # and has been asserted to exist.
+        ref_name_for_filename = problem_name 
+    
+    sanitized_ref_name = re.sub(r'[^a-zA-Z0-9_]', '_', ref_name_for_filename)
+
+    run_data = {
+        "timestamp": run_timestamp,
+        "triton_code_path": os.path.abspath(config.kernel_src_path)
+    }
+
+    if config.ref_origin == "local":
+        run_data["reference_code_identifier"] = os.path.abspath(config.ref_arch_src_path)
+    elif config.ref_origin == "kernelbench":
+        run_data["reference_code_identifier"] = f"kernelbench:level_{config.level}:problem_{config.problem_id}:{problem_name}"
+
+    log_kernel_type = None
+    if kernel_eval_result and hasattr(kernel_eval_result, 'metadata') and "kernel_type" in kernel_eval_result.metadata:
+        log_kernel_type = kernel_eval_result.metadata["kernel_type"]
+    elif config.force_triton:
+        log_kernel_type = "triton"
+    else: # auto_detect or default CUDA
+        # kernel_src is defined earlier in main and is the source code string
+        is_triton_detected_for_log = kernel_eval.detect_triton_kernel(kernel_src)
+        log_kernel_type = "triton" if is_triton_detected_for_log else "CUDA"
+    run_data["kernel_type"] = log_kernel_type
+    
+    output_path = None
+
+    if kernel_eval_result is None:
+        run_data["status"] = "critical_eval_failure"
+        run_data["error_message"] = "Evaluation function returned None, possibly due to file system lock/permission issues during compilation."
+        run_data["compilation_passed"] = False
+        run_data["correctness_passed"] = False
+        
+        json_filename = f"run_{run_timestamp}_{sanitized_ref_name}_failed.json"
+        output_path = os.path.join(failed_dir, json_filename)
+
+    elif kernel_eval_result.correctness:
+        run_data["status"] = "success"
+        run_data["compilation_passed"] = kernel_eval_result.compiled
+        run_data["correctness_passed"] = True
+        
+        run_data["forward_pass"] = {
+            "kernel_exec_time_ms": kernel_exec_time,
+            "ref_exec_eager_time_ms": ref_exec_eager_time,
+            "ref_exec_compile_time_ms": ref_exec_compile_time
+        }
+        
+        if kernel_exec_time is not None and kernel_exec_time > 0:
+            if ref_exec_eager_time is not None:
+                speedup_eager = ref_exec_eager_time / kernel_exec_time
+                run_data["forward_pass"]["speedup_over_eager"] = float(f"{speedup_eager:.2f}")
+                run_data["forward_pass"]["beat_eager"] = speedup_eager > 1.0
+            else:
+                run_data["forward_pass"]["speedup_over_eager"] = None
+                run_data["forward_pass"]["beat_eager"] = False
+
+            if ref_exec_compile_time is not None:
+                speedup_compile = ref_exec_compile_time / kernel_exec_time
+                run_data["forward_pass"]["speedup_over_torch_compile"] = float(f"{speedup_compile:.2f}")
+                run_data["forward_pass"]["beat_torch_compile"] = speedup_compile > 1.0
+            else:
+                run_data["forward_pass"]["speedup_over_torch_compile"] = None
+                run_data["forward_pass"]["beat_torch_compile"] = False
+        else:
+            run_data["forward_pass"]["speedup_over_eager"] = None
+            run_data["forward_pass"]["beat_eager"] = False
+            run_data["forward_pass"]["speedup_over_torch_compile"] = None
+            run_data["forward_pass"]["beat_torch_compile"] = False
+            
+        json_filename = f"run_{run_timestamp}_{sanitized_ref_name}_successful.json"
+        output_path = os.path.join(successful_dir, json_filename)
+        
+    else: # Failed (either compilation or correctness, but kernel_eval_result exists)
+        run_data["status"] = "failure"
+        run_data["compilation_passed"] = kernel_eval_result.compiled
+        run_data["correctness_passed"] = kernel_eval_result.correctness
+        
+        error_metadata = kernel_eval_result.metadata if hasattr(kernel_eval_result, 'metadata') else {}
+
+        if not kernel_eval_result.compiled:
+            run_data["error_category"] = error_metadata.get("error_category", "unknown_compilation_error")
+            run_data["error_message"] = error_metadata.get("compilation_error", error_metadata.get("runtime_error", "No compilation error message provided."))
+        elif not kernel_eval_result.correctness:
+            run_data["error_category"] = error_metadata.get("error_category", "unknown_runtime_error_or_correctness_issue")
+            error_msg = error_metadata.get("runtime_error")
+            if not error_msg:
+                error_msg = error_metadata.get("correctness_issue", "No specific error message provided.")
+            run_data["error_message"] = error_msg
+        else: 
+            run_data["error_category"] = "unknown_failure_state"
+            run_data["error_message"] = "Inconsistent state: Correctness is false but no specific error captured."
+
+        json_filename = f"run_{run_timestamp}_{sanitized_ref_name}_failed.json"
+        output_path = os.path.join(failed_dir, json_filename)
+
+    if output_path:
+        with open(output_path, 'w') as f:
+            json.dump(run_data, f, indent=4)
+        print(f"[INFO] Evaluation results saved to {output_path}")
+    else:
+        print("[ERROR] Could not determine output path for JSON log.")
+
+    # --- END NEW JSON LOGGING CODE ---
 
 if __name__ == "__main__":
     main() 

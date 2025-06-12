@@ -3,6 +3,11 @@ import os
 import sys
 from typing import Dict, Any, Optional
 
+# New imports
+import json
+import datetime
+import re
+
 app = modal.App("triton_run_and_check")
 
 """
@@ -56,7 +61,9 @@ def run_triton_check_remote(
     num_correct_trials: int = 5,
     num_perf_trials: int = 100,
     verbose: bool = True,
-    gpu_arch: str = "Hopper"
+    gpu_arch: str = "Hopper",
+    kernel_file_identifier: Optional[str] = None,
+    reference_file_identifier: Optional[str] = None
 ):
     """Remote function to run Triton evaluation"""
     import sys
@@ -258,19 +265,19 @@ def run_triton_check_remote(
         
         # Format results
         response = {
-            "status": "completed",
+            "status": "completed", # This outer status means the Modal function itself completed
             "problem_name": problem_name,
             "kernel_type": kernel_type,
             "compiled": result.compiled,
             "correctness": result.correctness,
-            "runtime_us": result.runtime,  # runtime is in microseconds
-            "runtime_ms": kernel_exec_time,  # runtime in milliseconds
+            "runtime_us": result.runtime,
+            "runtime_ms": kernel_exec_time, 
             "ref_eager_time_ms": ref_exec_eager_time,
             "ref_compile_time_ms": ref_exec_compile_time,
             "speedup_over_eager": speedup_eager,
             "speedup_over_compile": speedup_compile,
             "metadata": result.metadata,
-            "evaluation_output": evaluation_output,  # Include captured output
+            "evaluation_output": evaluation_output,
             "evaluation_error": evaluation_error
         }
         
@@ -293,6 +300,79 @@ def run_triton_check_remote(
         if result.metadata and verbose:
             print(f"📋 Metadata: {result.metadata}")
             
+        # --- BEGIN REVISED JSON LOG PREPARATION ---
+        run_data = {
+            "timestamp": datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "triton_code_path": kernel_file_identifier if kernel_file_identifier else "N/A (ran remotely via Modal - path not passed)",
+            "reference_code_identifier": reference_file_identifier if reference_file_identifier else "Local Reference (path not passed)",
+            "kernel_type": kernel_type
+            # status, compilation_passed, correctness_passed will be set below
+        }
+
+        # Determine problem_name_for_filename and specific reference_code_identifier
+        problem_name_for_filename = "unknown_problem"
+        if ref_origin == "kernelbench":
+            # problem_name is already fetched from dataset earlier in this function
+            run_data["reference_code_identifier"] = f"kernelbench:level_{level}:problem_{problem_id}:{problem_name}"
+            problem_name_for_filename = problem_name
+        elif ref_origin == "local":
+            run_data["reference_code_identifier"] = reference_file_identifier if reference_file_identifier else "Local Reference (path not passed)"
+            if reference_file_identifier:
+                problem_name_for_filename = os.path.splitext(os.path.basename(reference_file_identifier))[0]
+            else:
+                problem_name_for_filename = "local_reference_unknown_name"
+
+        sanitized_ref_name = re.sub(r'[^a-zA-Z0-9_]', '_', problem_name_for_filename)
+        json_filename_stem_base = f"run_{run_data['timestamp']}_{sanitized_ref_name}"
+
+        if result.compiled and result.correctness:
+            run_data["status"] = "success"
+            run_data["compilation_passed"] = True
+            run_data["correctness_passed"] = True
+            run_data["forward_pass"] = {
+                "kernel_exec_time_ms": kernel_exec_time * 1000 if kernel_exec_time is not None else None,
+                "ref_exec_eager_time_ms": ref_exec_eager_time,
+                "ref_exec_compile_time_ms": ref_exec_compile_time
+            }
+            if kernel_exec_time is not None and kernel_exec_time > 0:
+                _kernel_time_ms = kernel_exec_time * 1000
+                if ref_exec_eager_time is not None:
+                    _speedup_eager = ref_exec_eager_time / _kernel_time_ms
+                    run_data["forward_pass"]["speedup_over_eager"] = float(f"{_speedup_eager:.2f}")
+                    run_data["forward_pass"]["beat_eager"] = _speedup_eager > 1.0
+                if ref_exec_compile_time is not None:
+                    _speedup_compile = ref_exec_compile_time / _kernel_time_ms
+                    run_data["forward_pass"]["speedup_over_torch_compile"] = float(f"{_speedup_compile:.2f}")
+                    run_data["forward_pass"]["beat_torch_compile"] = _speedup_compile > 1.0
+            
+            json_filename_stem = f"{json_filename_stem_base}_successful.json"
+            relative_json_path = os.path.join("successful", json_filename_stem)
+        else: # Either not compiled or not correct
+            run_data["status"] = "failure"
+            run_data["compilation_passed"] = result.compiled
+            run_data["correctness_passed"] = result.correctness # Will be False if not compiled or explicitly False
+
+            error_metadata = result.metadata if hasattr(result, 'metadata') and result.metadata else {}
+            if not result.compiled:
+                run_data["error_category"] = error_metadata.get("error_category", "unknown_compilation_error")
+                run_data["error_message"] = error_metadata.get("compilation_error", error_metadata.get("runtime_error", "No compilation error message provided."))
+            elif not result.correctness: # Compiled but not correct
+                run_data["error_category"] = error_metadata.get("error_category", "correctness_failure_or_runtime_error_in_eval")
+                error_msg = error_metadata.get("runtime_error") # This usually has the specific error for correctness phase
+                if not error_msg:
+                    error_msg = error_metadata.get("correctness_issue", "Correctness check failed.")
+                run_data["error_message"] = error_msg
+            else: # Should not be reached if previous conditions are correct
+                run_data["error_category"] = "unknown_failure_state_in_json_logic"
+                run_data["error_message"] = "Inconsistent state detected during JSON log preparation."
+
+            json_filename_stem = f"{json_filename_stem_base}_failed.json"
+            relative_json_path = os.path.join("failed", json_filename_stem)
+
+        response["json_log_content"] = json.dumps(run_data, indent=4)
+        response["json_log_filename"] = relative_json_path
+        # --- END REVISED JSON LOG PREPARATION ---
+            
         return response
         
     except Exception as e:
@@ -300,12 +380,77 @@ def run_triton_check_remote(
         evaluation_output = captured_output.getvalue()
         evaluation_error = captured_error.getvalue()
         
+        # --- BEGIN JSON LOG PREPARATION FOR FAILURE ---
+        # Basic info for failure log
+        _problem_name_on_fail = "unknown_problem"
+        _reference_identifier_on_fail = "unknown_reference"
+
+        if ref_origin == "kernelbench":
+            if 'problem_name' in locals() and problem_name: # problem_name from dataset
+                _problem_name_on_fail = problem_name
+                _reference_identifier_on_fail = f"kernelbench:level_{level}:problem_{problem_id}:{problem_name}"
+            else: # Fallback
+                _problem_name_on_fail = f"level{level}_problem{problem_id}"
+                _reference_identifier_on_fail = f"kernelbench:level_{level}:problem_{problem_id}:unknown_name"
+        elif ref_origin == "local":
+            if reference_file_identifier:
+                _problem_name_on_fail = os.path.splitext(os.path.basename(reference_file_identifier))[0]
+                _reference_identifier_on_fail = reference_file_identifier
+            else:
+                _problem_name_on_fail = "local_ref_unknown_name"
+                _reference_identifier_on_fail = "Local Reference (path not passed)"
+        
+        _kernel_type_on_fail = "unknown"
+        if 'kernel_type' in locals() and kernel_type:
+            _kernel_type_on_fail = kernel_type
+        else:
+            # Try to detect if not already set
+            try:
+                _is_triton_detected = detect_triton_kernel(kernel_src)
+                _kernel_type_on_fail = "Triton" if _is_triton_detected else "CUDA"
+            except:
+                pass # keep as unknown
+
+        run_data_failure = {
+            "timestamp": datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "triton_code_path": kernel_file_identifier if kernel_file_identifier else "N/A (ran remotely via Modal - path not passed)",
+            "reference_code_identifier": _reference_identifier_on_fail,
+            "kernel_type": _kernel_type_on_fail,
+            "status": "failure",
+            "compilation_passed": False, # Assume False on general exception, specific errors might refine this
+            "correctness_passed": False,
+            "error_category": type(e).__name__,
+            "error_message": str(e),
+            "evaluation_output_at_failure": evaluation_output,
+            "evaluation_error_at_failure": evaluation_error
+        }
+
+        # Update compilation/correctness if some results were obtained before exception
+        if 'result' in locals() and result and hasattr(result, 'compiled'):
+            run_data_failure["compilation_passed"] = result.compiled
+        if 'result' in locals() and result and hasattr(result, 'correctness'):
+            run_data_failure["correctness_passed"] = result.correctness
+        if 'result' in locals() and result and hasattr(result, 'metadata') and result.metadata:
+            if result.metadata.get("error_category"):
+                 run_data_failure["error_category"] = result.metadata.get("error_category")
+            if result.metadata.get("compilation_error"):
+                 run_data_failure["error_message"] = result.metadata.get("compilation_error")
+            elif result.metadata.get("runtime_error"):
+                 run_data_failure["error_message"] = result.metadata.get("runtime_error")
+
+        sanitized_ref_name_fail = re.sub(r'[^a-zA-Z0-9_]', '_', _problem_name_on_fail)
+        json_filename_stem_fail = f"run_{run_data_failure['timestamp']}_{sanitized_ref_name_fail}_failed.json"
+        relative_json_path_fail = os.path.join("failed", json_filename_stem_fail)
+        # --- END JSON LOG PREPARATION FOR FAILURE ---
+
         error_response = {
             "status": "failed",
             "error": str(e),
             "error_type": type(e).__name__,
             "evaluation_output": evaluation_output,
-            "evaluation_error": evaluation_error
+            "evaluation_error": evaluation_error,
+            "json_log_content": json.dumps(run_data_failure, indent=4),
+            "json_log_filename": relative_json_path_fail
         }
         print(f"❌ Error: {e}")
         if evaluation_output:
@@ -384,7 +529,9 @@ def run_triton_check(
             num_correct_trials=num_correct_trials,
             num_perf_trials=num_perf_trials,
             verbose=verbose,
-            gpu_arch=gpu
+            gpu_arch=gpu,
+            kernel_file_identifier=kernel_src_path,
+            reference_file_identifier=ref_arch_src_path if ref_origin == "local" else None
         )
         
         print("\n" + "="*60)
@@ -443,6 +590,29 @@ def run_triton_check(
         elif result["status"] == "error":
             print(f"⚠️  Status: {result['status']}")
             print(f"⚠️  Message: {result['message']}")
+            
+        # --- BEGIN LOCAL JSON LOG SAVING ---
+        if result.get("json_log_content") and result.get("json_log_filename"):
+            json_content = result["json_log_content"]
+            # json_log_filename from remote already includes successful/ or failed/
+            relative_json_path = result["json_log_filename"]
+            
+            output_base_dir = "runs" # Local base directory for logs
+            local_json_full_path = os.path.join(output_base_dir, relative_json_path)
+            
+            # Ensure the local directory structure exists (e.g., runs/successful/ or runs/failed/)
+            local_json_dir = os.path.dirname(local_json_full_path)
+            os.makedirs(local_json_dir, exist_ok=True)
+            
+            try:
+                with open(local_json_full_path, 'w') as f:
+                    f.write(json_content)
+                print(f"[INFO] Evaluation results saved locally to {local_json_full_path}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save JSON log locally: {e}")
+        else:
+            print("[WARNING] JSON log content or filename not found in Modal results. Skipping local save.")
+        # --- END LOCAL JSON LOG SAVING ---
             
         print("\n🎯 Modal evaluation completed!")
         return result
