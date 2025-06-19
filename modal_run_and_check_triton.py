@@ -242,7 +242,7 @@ def run_triton_check_remote(
             print("⚠️ EVALUATION WARNINGS/ERRORS:")
             print(evaluation_error)
         
-        # Parse timing results from captured output
+        # Parse timing results from captured output (re already imported above)
         speedup_eager = None
         speedup_compile = None
         ref_exec_eager_time = None
@@ -250,7 +250,6 @@ def run_triton_check_remote(
         kernel_exec_time = result.runtime / 1000.0 if result.runtime > 0 else None
         
         # Extract timing information from the captured output
-        import re
         if evaluation_output:
             # Look for timing lines in the output
             eager_match = re.search(r'PyTorch Reference Eager exec time: ([\d.]+) ms', evaluation_output)

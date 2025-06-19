@@ -10,10 +10,10 @@ Usage:
     python run_triton_modal.py --kernel my_triton_kernel.py --level 1 --problem_id 3
     
     # Against local reference
-    python run_triton_modal.py --kernel my_triton_kernel.py --reference my_reference.py
+    python run_triton_kernel.py --kernel my_triton_kernel.py --reference my_reference.py
     
     # Quick test (fewer trials)
-    python run_triton_modal.py --kernel my_triton_kernel.py --level 1 --problem_id 3 --quick
+    python run_triton_kernel.py --kernel my_triton_kernel.py --level 1 --problem_id 3 --quick
 """
 
 import os
