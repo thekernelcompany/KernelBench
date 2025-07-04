@@ -1,11 +1,20 @@
-# KernelBench: Can LLMs Write Efficient GPU Kernels? [ICML '25]
-[arXiv](https://arxiv.org/html/2502.10517v1) | [blog post](https://scalingintelligence.stanford.edu/blogs/kernelbench/) | [HuggingFace Dataset](https://huggingface.co/datasets/ScalingIntelligence/KernelBench) | 
+# KernelBench-v2: Can LLMs Write Efficient GPU Kernels? 
+[blog post](https://letters.lossfunk.com/p/780796ba-8f4d-494b-8898-b80f0636d2b7) 
 
 A benchmark for evaluating LLMs' ability to generate efficient GPU kernels
 
 <img src="./assets/figures/KernelBenchMascot.png" width="200">
 
 <!-- See [blog post](https://scalingintelligence.stanford.edu/blogs/kernelbench/) and [arXiv paper](https://arxiv.org/html/2502.10517v1) for more details. -->
+
+## ✨ What's New in KernelBench-v2
+
+- **Triton Integration**: Native support for Triton kernels with automatic detection and a production-ready evaluation pipeline (`scripts/run_and_check_triton.py`).
+- **Unified Evaluation**: CUDA and Triton kernels now share the same correctness and performance metrics.
+- **Docker Environment**: Reproducible environment via the root `Dockerfile` (CUDA 12.4 + Triton + PyTorch 2.5).
+- **Robust Error Handling**: 15+ categorized runtime/compilation error classes for easier debugging.
+- **Compile-Cache Builder**: New `build_compile_cache_triton` helper for fast batched evaluation.
+- **Expanded Docs**: See `TRITON_README.md` for a quick start and `TRITON_INTEGRATION_GUIDE.md` for an in-depth technical deep-dive.
 
 ## 👋 Task Description
 We structure the problem for LLM to transpile operators described in PyTorch to CUDA kernels, at whatever level of granularity it desires to.
@@ -47,22 +56,24 @@ You can increase speedup threshold `p` to make the task more challenging.
 We provide a script `scripts/greedy_analysis.py` to compute the overall benchmark performance. 
 Since we need to capture **both** correctness and performance, we use a metric `fast_p`: fraction of tasks that are both correct and have a speedup greater than threshold `p`; speedup is computed as the ratio of PyTorch reference wall-clock time to generated kernel time.
 
-<!-- TODO: update to provide fast_p measurement script -->
-
 ## 🔍 Directory Structure
 We organize the repo into the following structure:
 ```
-KernelBench/
+KernelBench-v2/
 ├── assets/
-├── KernelBench/ # Benchmark dataset files
-├── src/ # KernelBench logic code
-│   ├── unit_tests/  
-│   ├── prompts/
-│   ├── ....
-├── scripts/ # helpful scripts to run the benchmark
-├── results/ # baseline times across hardware 
-├── runs/ # where your runs will be stored
+│   └── figures/
+├── KernelBench/                 # Benchmark dataset (problems & reference PyTorch)
+├── src/                         # Core benchmark logic
+│   ├── unit_tests/              # PyTest unit tests
+│   ├── prompts/                 # Prompt templates & example kernels
+│   ├── …
+├── scripts/                     # Helper CLI entry-points (generation, eval, analysis)
+├── triton_test/                 # Stand-alone Triton examples / kernels
+├── results/                     # Baseline timings & evaluation outputs
+├── docker-compose.yml & Dockerfile  # Reproducible container env
+└── runs/                        # Generated model outputs live here
 ```
+
 
 ## 🔧 Set up
 ```
@@ -71,6 +82,17 @@ conda activate kernel-bench
 pip install -r requirements.txt
 pip install -e . 
 ```
+
+> **Docker Quick-Start** (GPU required):
+> ```bash
+> # 1. Build image & launch dev container
+> docker compose up --build -d  # spins up `kernelbench-triton`
+>
+> # 2. Attach an interactive shell (optional)
+> docker exec -it kernelbench-triton bash
+> ```
+
+> **Note (v2)**: If you intend to run or evaluate Triton kernels, also install Triton with `pip install triton`.
 
 To call LLM API providers, set your `{INFERENCE_SERVER_PROVIDER}_API_KEY` API key.
 
@@ -165,3 +187,18 @@ MIT. Check `LICENSE.md` for more details.
       url={https://arxiv.org/abs/2502.10517}, 
 }
 ```
+
+## 🧪 Testing & CI
+
+Run the full unit-test and integration suite locally:
+
+```bash
+# Run fast unit tests
+pytest -q src/unit_tests
+
+# Sanity-check reference problems compile & run
+python scripts/verify_bench.py               # CUDA kernels
+python test_triton_integration.py            # Triton kernels
+```
+
+All tests also run in CI via GitHub Actions (see `.github/workflows/ci.yml`).
